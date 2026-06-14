@@ -86,15 +86,34 @@ public let VAE_STD: [Float] = [
 /// Optional cached tensors, indexed by conv slot.
 public final class FeatCache: @unchecked Sendable {
     public var slots: [MLXArray?]
+    // E11: third cache state for the streaming upsample3d first-chunk skip.
+    // A slot is `empty` (nil), `cached` (a real tensor), or `Rep` — the Python
+    // `_REP` sentinel meaning "this upsample3d saw only the first chunk's
+    // bypassed frame 0, so the NEXT chunk's time_conv must zero-pad (a fresh
+    // causal start for the 'rest'), NOT prepend a real cached frame."
+    private var repSlots: [Bool]
 
     public init(count: Int) {
         self.slots = Array(repeating: nil, count: count)
+        self.repSlots = Array(repeating: false, count: count)
     }
 
     public subscript(idx: Int) -> MLXArray? {
         get { slots[idx] }
-        set { slots[idx] = newValue }
+        set {
+            slots[idx] = newValue
+            repSlots[idx] = false  // any concrete write clears the Rep sentinel
+        }
     }
+
+    /// Mark `idx` as the `Rep` sentinel (first-chunk frame-0 bypass; no tensor).
+    public func setRep(_ idx: Int) {
+        slots[idx] = nil
+        repSlots[idx] = true
+    }
+
+    /// Whether `idx` currently holds the `Rep` sentinel.
+    public func isRep(_ idx: Int) -> Bool { repSlots[idx] }
 }
 
 /// Reference wrapper for Python's `feat_idx = [0]` single-int box.

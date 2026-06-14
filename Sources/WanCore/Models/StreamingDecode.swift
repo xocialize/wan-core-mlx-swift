@@ -49,28 +49,82 @@ private func spatialUpsample(_ rs: Resample, _ x: MLXArray) -> MLXArray {
     return xf.reshaped(b, t, h * 2, w * 2, co).transposed(0, 4, 1, 2, 3)
 }
 
-/// Streaming upsample3d: cached `time_conv` (causal zero-pad on the first
-/// chunk, prev-chunk tail thereafter) + interleave + spatial. mlx-video's
-/// stock upsample3d always doubles every frame — no first-chunk frame-0 skip.
+/// Streaming upsample3d reproducing the corrected whole-seq first-chunk skip
+/// (E11) BIT-IDENTICALLY, chunk-by-chunk, via the 3-state `Rep` cache.
+///
+/// Whole-seq `Resample.upsample3d` (featCache==nil) bypasses time_conv for
+/// frame 0 of the first chunk and zero-pads the `rest` (-> 2T-1, not 2T). To
+/// match that streaming-wise:
+///   - `first` chunk, chunk-local T>1: do the bypass (frame 0 passes through,
+///     rest gets time_conv with a zero-padded causal start); cache the rest tail.
+///   - `first` chunk, T==1, `single` (whole latent is one frame, T_lat==1):
+///     mirror whole-seq's else branch — DOUBLE the lone frame (zero-pad).
+///   - `first` chunk, T==1, more chunks follow: mark `Rep` — frame 0 is NOT
+///     doubled and the NEXT chunk must zero-pad (treat its frame as the fresh
+///     start of `rest`), so don't seed the cache with frame 0.
+///   - later chunks: standard cached time_conv, except a `Rep` predecessor
+///     forces a zero-pad (cacheX=nil) — the first `rest` frame after the skip.
 private func resampleUpsample3dCached(
-    _ rs: Resample, _ x: MLXArray, _ fc: FeatCache, _ fi: FeatIdx
+    _ rs: Resample, _ x: MLXArray, _ fc: FeatCache, _ fi: FeatIdx,
+    first: Bool, single: Bool
 ) -> MLXArray {
-    let (b, c, t, h, w) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3), x.dim(4))
+    var x = x
+    let (b, c, h, w) = (x.dim(0), x.dim(1), x.dim(3), x.dim(4))
+    let t = x.dim(2)
     let idx = fi.value
-    var cacheX = x[0..., 0..., Swift.max(0, x.dim(2) - CACHE_T)...]
-    if cacheX.dim(2) < 2, let cached = fc[idx] {
-        cacheX = concatenated([cached[0..., 0..., (cached.dim(2) - 1)...], cacheX], axis: 2)
+
+    if first {
+        if t > 1 {
+            // frame 0 bypasses time_conv; rest = x[:,:,1:] gets a zero-padded
+            // causal start (cacheX=nil) -> 1 + (T-1)*2 = 2T-1.
+            let firstFrame = x[0..., 0..., 0..<1]
+            let rest = x[0..., 0..., 1...]
+            let tc = rs.timeConv!(rest)
+            let restUp = temporalInterleave(tc, b, c, t - 1, h, w)
+            x = concatenated([firstFrame, restUp], axis: 2)
+            // cache for the next chunk = last CACHE_T frames of the conv INPUT (rest).
+            fc[idx] = rest[0..., 0..., Swift.max(0, rest.dim(2) - CACHE_T)...]
+        } else if single {
+            // whole latent is one frame: whole-seq's `t>1` test is false, so it
+            // doubles the lone frame. No chunk follows; cache is moot.
+            let boundary = x[0..., 0..., Swift.max(0, t - CACHE_T)...]
+            let tc = rs.timeConv!(x)
+            x = temporalInterleave(tc, b, c, t, h, w)
+            fc[idx] = boundary
+        } else {
+            // single-frame first chunk, more chunks follow: bypass (no doubling),
+            // next chunk zero-pads. x (one frame) passes straight to spatial.
+            fc.setRep(idx)
+        }
+        fi.value += 1
+    } else {
+        let isRep = fc.isRep(idx)
+        let prev = fc[idx]  // nil when Rep
+        var cacheX = x[0..., 0..., Swift.max(0, t - CACHE_T)...]
+        if cacheX.dim(2) < 2, !isRep, let prev {
+            cacheX = concatenated([prev[0..., 0..., (prev.dim(2) - 1)...], cacheX], axis: 2)
+        }
+        if cacheX.dim(2) < 2, isRep {
+            // Rep predecessor: the fresh `rest` start zero-pads, so the carried
+            // cache is [0, frame] to feed the following chunk's causal window.
+            cacheX = concatenated([MLXArray.zeros(like: cacheX), cacheX], axis: 2)
+        }
+        let cacheArg: MLXArray? = isRep ? nil : prev  // Rep -> zero-pad
+        let tc = rs.timeConv!(x, cacheX: cacheArg)
+        fc[idx] = cacheX
+        fi.value += 1
+        x = temporalInterleave(tc, b, c, t, h, w)
     }
-    let tc = rs.timeConv!(x, cacheX: fc[idx])  // fc[idx]=nil first chunk -> zero-pad
-    fc[idx] = cacheX
-    fi.value += 1
-    let interleaved = temporalInterleave(tc, b, c, t, h, w)
-    return spatialUpsample(rs, interleaved)
+
+    return spatialUpsample(rs, x)
 }
 
 /// One latent chunk through Decoder3d, threading the shared temporal cache.
+/// `first` = global first chunk (drives the upsample3d frame-0 skip); `single`
+/// = the whole latent is a single frame (T_lat==1), which whole-seq doubles.
 private func decoderChunk(
-    _ decoder: Decoder3d, _ x: MLXArray, _ fc: FeatCache, _ fi: FeatIdx
+    _ decoder: Decoder3d, _ x: MLXArray, _ fc: FeatCache, _ fi: FeatIdx,
+    first: Bool, single: Bool
 ) -> MLXArray {
     var x = convCached(decoder.conv1, x, fc, fi)
     for layer in decoder.middle {
@@ -86,7 +140,7 @@ private func decoderChunk(
             x = layer(x, featCache: fc, featIdx: fi)
         case let layer as Resample:
             if layer.mode == "upsample3d" {
-                x = resampleUpsample3dCached(layer, x, fc, fi)
+                x = resampleUpsample3dCached(layer, x, fc, fi, first: first, single: single)
             } else {  // upsample2d: per-frame, no temporal
                 x = layer(x)
             }
@@ -109,14 +163,19 @@ public func decodeStreaming(
     let z = z / invStd + mean
 
     let tLat = z.dim(2)
+    // T_lat==1: whole-seq decode doubles the lone latent frame at the first
+    // upsample3d (its `t>1` bypass test is false), so the single chunk must
+    // double too rather than `Rep`-defer (which only suits a multi-chunk stream).
+    let single = tLat == 1
     let fc = FeatCache(count: 64)  // generous; one slot per cached conv
     var outs: [MLXArray] = []
     var start = 0
     while start < tLat {
+        let first = start == 0
         let zc = z[0..., 0..., start..<Swift.min(start + chunkLat, tLat)]
         let xc = vae.conv2(zc)  // kernel-1, per-frame, no cache
         let fi = FeatIdx()
-        let oc = decoderChunk(vae.decoder, xc, fc, fi)
+        let oc = decoderChunk(vae.decoder, xc, fc, fi, first: first, single: single)
         // Materialize the carried cache too — else fc holds lazy slice-views
         // into this chunk's freed buffers, which alias/go stale across the
         // boundary (fails at >2 chunks).
