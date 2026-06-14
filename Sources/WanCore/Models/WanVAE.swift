@@ -399,11 +399,24 @@ public final class Resample: Module, @unchecked Sendable {
         var t = x.dim(2)
 
         if mode == "upsample3d" {
-            // Temporal upsample via learned conv
-            var xT = timeConv!(x)  // [B, 2C, T, H, W]
-            xT = xT.reshaped(b, 2, c, t, h, w)
-            x = stacked([xT[0..., 0], xT[0..., 1]], axis: 3).reshaped(b, c, t * 2, h, w)
-            t = t * 2
+            // Temporal upsample via learned conv. Official Wan2.2 BYPASSES time_conv
+            // for frame 0 of the FIRST chunk (a whole-seq decode IS the first chunk),
+            // giving 2T-1, NOT 2T. E11: the stock mlx-video path always-doubled →
+            // T_lat*4 output frames (e.g. 20 for a 17-frame request) instead of the
+            // correct (T_lat-1)*4+1. Ported from the test-verified wan/vae22.py.
+            if featCache == nil && t > 1 {
+                let first = x[0..., 0..., 0..<1]  // frame 0 bypasses time_conv
+                let rest = x[0..., 0..., 1...]  // [B, C, T-1, H, W]
+                let xT = timeConv!(rest).reshaped(b, 2, c, t - 1, h, w)
+                let restUp = stacked([xT[0..., 0], xT[0..., 1]], axis: 3)
+                    .reshaped(b, c, (t - 1) * 2, h, w)
+                x = concatenated([first, restUp], axis: 2)  // 1 + (T-1)*2 = 2T-1
+                t = 2 * t - 1
+            } else {
+                let xT = timeConv!(x).reshaped(b, 2, c, t, h, w)  // [B, 2C, T, H, W]
+                x = stacked([xT[0..., 0], xT[0..., 1]], axis: 3).reshaped(b, c, t * 2, h, w)
+                t = t * 2
+            }
         }
 
         if mode.hasPrefix("upsample") {
