@@ -244,6 +244,22 @@ public final class WanModel: Module, @unchecked Sendable {
     /// - seqLen: maximum sequence length for padding
     /// - y: optional I2V conditioning, channel-concatenated before patchify
     /// Returns denoised tensors [C, F, H, W] in float32.
+    /// Intermediate state threaded `embed` → `runBlocks` → `finish`. Exposing the phases lets a
+    /// consumer (e.g. a VACE Context Adapter) run a parallel branch on the embedded latent `x` and
+    /// the SAME per-block kwargs (`e0`/`seqLens`/`gridSizes`/`freqs`/`context`/`attnMask`), then
+    /// inject per-block residuals — without re-implementing the forward. `callAsFunction` composes
+    /// the three with no injection, so existing consumers are byte-for-byte unchanged.
+    public struct ForwardState {
+        public var x: MLXArray
+        public let e: MLXArray
+        public let e0: MLXArray
+        public let seqLensList: [Int]
+        public let gridSizes: [(Int, Int, Int)]
+        public let contextBatch: MLXArray
+        public let attnMask: MLXArray?
+        public let batchSize: Int
+    }
+
     public func callAsFunction(
         _ xList: [MLXArray],
         t: MLXArray,
@@ -253,6 +269,19 @@ public final class WanModel: Module, @unchecked Sendable {
         y: [MLXArray]? = nil,
         ropeCosSin: (MLXArray, MLXArray)? = nil
     ) -> [MLXArray] {
+        var s = embed(xList, t: t, context: context, seqLen: seqLen, y: y)
+        runBlocks(&s, crossKVCaches: crossKVCaches, ropeCosSin: ropeCosSin)
+        return finish(s)
+    }
+
+    /// Phase 1 — patchify + time/text embedding + attention mask. Returns the block inputs.
+    public func embed(
+        _ xList: [MLXArray],
+        t: MLXArray,
+        context: WanTextContext,
+        seqLen: Int,
+        y: [MLXArray]? = nil
+    ) -> ForwardState {
         // Detect identical inputs (CFG B=2) to avoid duplicate patchify work.
         // Check BEFORE I2V concat since concat creates new array objects.
         let batchSize = xList.count
@@ -345,34 +374,46 @@ public final class WanModel: Module, @unchecked Sendable {
             attnMask = paddingMask(seqLens: seqLensList, total: seqLen, dtype: wDtype)
         }
 
-        // Run transformer blocks. At large sequence length (multi-frame video on the
-        // GPU), bf16 attention on Metal is numerically unstable — see `wanLargeSeq`:
-        // we `eval` after each block to BOUND the lazy graph (mlx-lm-idiomatic graph-size
-        // control) which also resets MLX's Metal buffer-reuse, suppressing the
-        // nondeterministic long-seq NaN. Paired with fp32 SDPA in the attention modules.
-        // Small-seq paths (t2i, low-res, A14B-validated) keep the unbounded bf16 graph,
-        // so they stay bit-identical. (`WANCORE_DEBUG_NAN` adds a finiteness probe.)
-        let evalEachBlock = x.dim(1) >= wanLargeSeq
+        return ForwardState(
+            x: x, e: e, e0: e0, seqLensList: seqLensList, gridSizes: gridSizes,
+            contextBatch: contextBatch, attnMask: attnMask, batchSize: batchSize)
+    }
+
+    /// Phase 2 — run the transformer blocks. `blockResiduals[i]`, if present, is added to `x` AFTER
+    /// block `i`: the generic ControlNet / T2I-Adapter / VACE injection seam (keys = main-block indices).
+    public func runBlocks(
+        _ s: inout ForwardState,
+        crossKVCaches: [(MLXArray, MLXArray)]? = nil,
+        ropeCosSin: (MLXArray, MLXArray)? = nil,
+        blockResiduals: [Int: MLXArray]? = nil
+    ) {
+        // At large sequence length (multi-frame video on the GPU), bf16 attention on Metal is
+        // numerically unstable — see `wanLargeSeq`: `eval` after each block BOUNDs the lazy graph
+        // (mlx-lm-idiomatic graph-size control), resetting MLX's Metal buffer-reuse and suppressing
+        // the nondeterministic long-seq NaN (paired with fp32 SDPA). Small-seq paths keep the
+        // unbounded bf16 graph, so they stay bit-identical. (`WANCORE_DEBUG_NAN` adds a probe.)
+        let evalEachBlock = s.x.dim(1) >= wanLargeSeq
         let debugNaN = ProcessInfo.processInfo.environment["WANCORE_DEBUG_NAN"] != nil
         for (i, block) in blocks.enumerated() {
             let kv = crossKVCaches?[i]
-            x = block(
-                x, e: e0, seqLens: seqLensList, gridSizes: gridSizes, freqs: freqs,
-                context: contextBatch, contextLens: nil, crossKVCache: kv,
-                ropeCosSin: ropeCosSin, attnMask: attnMask)
+            s.x = block(
+                s.x, e: s.e0, seqLens: s.seqLensList, gridSizes: s.gridSizes, freqs: freqs,
+                context: s.contextBatch, contextLens: nil, crossKVCache: kv,
+                ropeCosSin: ropeCosSin, attnMask: s.attnMask)
+            if let r = blockResiduals?[i] { s.x = s.x + r }
             if evalEachBlock || debugNaN {
-                eval(x)
-                if debugNaN, !x.abs().max().item(Float.self).isFinite {
+                eval(s.x)
+                if debugNaN, !s.x.abs().max().item(Float.self).isFinite {
                     print("[WANCORE_DEBUG_NAN] first non-finite after block \(i)")
                     break
                 }
             }
         }
+    }
 
-        // Output head
-        x = head(x, e)
-
-        // Unpatchify
-        return unpatchify(x, gridSizes: gridSizes).map { $0.asType(.float32) }
+    /// Phase 3 — output head + unpatchify.
+    public func finish(_ s: ForwardState) -> [MLXArray] {
+        let x = head(s.x, s.e)
+        return unpatchify(x, gridSizes: s.gridSizes).map { $0.asType(.float32) }
     }
 }
