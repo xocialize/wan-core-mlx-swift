@@ -479,3 +479,178 @@ public final class V22Resample: Module, @unchecked Sendable {
         return x
     }
 }
+
+// MARK: - unpatchify (2×2 spatial depth-to-space, channels-LAST)
+
+/// vae22.py `_unpatchify` — [B,T,H,W,C·p·p] → [B,T,H·p,W·p,C]. The decoder head
+/// emits 12 packed channels; unpatchify spreads them to 3 RGB at 2× spatial.
+public func unpatchify22(_ x: MLXArray, patchSize: Int = 2) -> MLXArray {
+    if patchSize == 1 { return x }
+    let (b, t, h, w, cPacked) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3), x.dim(4))
+    let c = cPacked / (patchSize * patchSize)
+    var y = x.reshaped(b, t, h, w, c, patchSize, patchSize)  // unpack (C, r, q)
+    y = y.transposed(0, 1, 2, 6, 3, 5, 4)  // [B, T, H, q, W, r, C]
+    return y.reshaped(b, t, h * patchSize, w * patchSize, c)
+}
+
+// MARK: - V22UpResidualBlock (decoder upsampling stage)
+
+/// vae22.py `Up_ResidualBlock` — (num_res_blocks) ResidualBlocks + optional Resample,
+/// plus a param-free DupUp3D `avg_shortcut` when this stage upsamples. The `upsamples`
+/// list keys (`upsamples.0`, …) match the checkpoint.
+public final class V22UpResidualBlock: Module, @unchecked Sendable {
+    public let upFlag: Bool
+    @ModuleInfo(key: "avg_shortcut") public var avgShortcut: DupUp3D?
+    public let upsamples: [Module]
+
+    public init(
+        inDim: Int, outDim: Int, numResBlocks: Int,
+        temperalUpsample: Bool = false, upFlag: Bool = false
+    ) {
+        self.upFlag = upFlag
+        var blocks = [Module]()
+        var dimIn = inDim
+        for _ in 0..<numResBlocks {
+            blocks.append(V22ResidualBlock(dimIn, outDim))
+            dimIn = outDim
+        }
+        if upFlag {
+            blocks.append(V22Resample(outDim, mode: temperalUpsample ? "upsample3d" : "upsample2d"))
+        }
+        self.upsamples = blocks
+        super.init()
+        self._avgShortcut.wrappedValue =
+            upFlag ? DupUp3D(inDim, outDim, factorT: temperalUpsample ? 2 : 1, factorS: 2) : nil
+    }
+
+    public func callAsFunction(_ x: MLXArray, firstChunk: Bool = false) -> MLXArray {
+        var xMain = x
+        for module in upsamples {
+            switch module {
+            case let r as V22Resample: xMain = r(xMain, firstChunk: firstChunk)
+            case let rb as V22ResidualBlock: xMain = rb(xMain)
+            default: fatalError("unexpected up-block: \(type(of: module))")
+            }
+            eval(xMain)  // bound graph size per sub-block
+        }
+        if let sc = avgShortcut {
+            let xShort = sc(x, firstChunk: firstChunk)
+            eval(xShort)
+            return xMain + xShort
+        }
+        return xMain
+    }
+}
+
+// MARK: - V22Head22 (decoder output head)
+
+/// vae22.py `Head22` — RMS_norm → SiLU → CausalConv3d(dim→12). Keys `layer_0`/`layer_2`.
+public final class V22Head22: Module, @unchecked Sendable {
+    @ModuleInfo(key: "layer_0") public var layer0: V22RMSNorm
+    @ModuleInfo(key: "layer_2") public var layer2: V22CausalConv3d
+
+    public init(_ dim: Int, outChannels: Int = 12) {
+        self._layer0.wrappedValue = V22RMSNorm(dim)
+        self._layer2.wrappedValue = V22CausalConv3d(dim, outChannels, 3, padding: 1)
+        super.init()
+    }
+
+    public func callAsFunction(
+        _ x0: MLXArray, featCache: FeatCache? = nil, featIdx: FeatIdx? = nil
+    ) -> MLXArray {
+        var x = silu(layer0(x0))
+        if let fc = featCache, let fi = featIdx {
+            let idx = fi.value
+            var cacheX = x[0..., Swift.max(0, x.dim(1) - CACHE_T)...]
+            if cacheX.dim(1) < 2, let cached = fc[idx] {
+                cacheX = concatenated([cached[0..., (cached.dim(1) - 1)...], cacheX], axis: 1)
+            }
+            x = layer2(x, cacheX: fc[idx])
+            fc[idx] = cacheX
+            fi.value += 1
+        } else {
+            x = layer2(x)
+        }
+        return x
+    }
+}
+
+// MARK: - V22Decoder3d
+
+/// vae22.py `Decoder3d` — conv1 → [ResBlock, AttnBlock, ResBlock] middle → 4 up stages
+/// → Head22. dims = [dim·mult[-1]] + [dim·m for m in reversed(mult)] = [1024,1024,1024,512,256].
+public final class V22Decoder3d: Module, @unchecked Sendable {
+    @ModuleInfo(key: "conv1") public var conv1: V22CausalConv3d
+    public let middle: [Module]
+    public let upsamples: [Module]
+    @ModuleInfo(key: "head") public var head: V22Head22
+
+    public init(
+        dim: Int = 256, zDim: Int = 48, dimMult: [Int] = [1, 2, 4, 4],
+        numResBlocks: Int = 2, temperalUpsample: [Bool] = [true, true, false]
+    ) {
+        let dims = [dim * dimMult.last!] + dimMult.reversed().map { dim * $0 }
+        self._conv1.wrappedValue = V22CausalConv3d(zDim, dims[0], 3, padding: 1)
+        self.middle = [
+            V22ResidualBlock(dims[0], dims[0]),
+            V22AttentionBlock(dims[0]),
+            V22ResidualBlock(dims[0], dims[0]),
+        ]
+        var ups = [Module]()
+        for i in 0..<(dims.count - 1) {
+            let tUp = i < temperalUpsample.count ? temperalUpsample[i] : false
+            ups.append(
+                V22UpResidualBlock(
+                    inDim: dims[i], outDim: dims[i + 1], numResBlocks: numResBlocks + 1,
+                    temperalUpsample: tUp, upFlag: i != dimMult.count - 1))
+        }
+        self.upsamples = ups
+        self._head.wrappedValue = V22Head22(dims.last!)
+        super.init()
+    }
+
+    /// x: [B, T, H, W, z_dim].
+    public func callAsFunction(_ x0: MLXArray, firstChunk: Bool = false) -> MLXArray {
+        var x = conv1(x0)
+        for layer in middle {
+            switch layer {
+            case let r as V22ResidualBlock: x = r(x)
+            case let a as V22AttentionBlock: x = a(x)
+            default: fatalError("unexpected middle layer: \(type(of: layer))")
+            }
+        }
+        eval(x)
+        for layer in upsamples {
+            x = (layer as! V22UpResidualBlock)(x, firstChunk: firstChunk)
+            eval(x)
+        }
+        return head(x)
+    }
+}
+
+// MARK: - Wan22VAEDecoder (full decode: conv2 → Decoder3d → unpatchify → clip)
+
+/// vae22.py `Wan22VAEDecoder` — the 48-ch channels-last decode path. Input `z` must
+/// already be denormalized (`denormalizeLatents22`). Output [B,T',H',W',3] in [-1,1],
+/// T' = (T_lat-1)·4+1 (E11 first-chunk temporal trim).
+public final class Wan22VAEDecoder: Module, @unchecked Sendable {
+    public let zDim: Int
+    @ModuleInfo(key: "conv2") public var conv2: V22CausalConv3d
+    @ModuleInfo(key: "decoder") public var decoder: V22Decoder3d
+
+    public init(zDim: Int = 48, dim: Int = 160, decDim: Int = 256) {
+        self.zDim = zDim
+        self._conv2.wrappedValue = V22CausalConv3d(zDim, zDim, 1)
+        self._decoder.wrappedValue = V22Decoder3d(
+            dim: decDim, zDim: zDim, dimMult: [1, 2, 4, 4], numResBlocks: 2,
+            temperalUpsample: [true, true, false])
+        super.init()
+    }
+
+    /// z: [B,T,H,W,48] (denormalized). → video [B,T',H',W',3] in [-1,1].
+    public func callAsFunction(_ z: MLXArray) -> MLXArray {
+        let x = conv2(z)
+        let out = decoder(x, firstChunk: true)
+        return clip(unpatchify22(out), min: MLXArray(Float(-1)), max: MLXArray(Float(1)))
+    }
+}
