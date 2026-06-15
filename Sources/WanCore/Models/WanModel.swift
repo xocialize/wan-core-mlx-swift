@@ -19,6 +19,19 @@ import MLXNN
 /// (safe); 512²×17f = 1280 (the first observed failure), so the gate sits between.
 public let wanLargeSeq = 1024
 
+/// EXPERIMENT KNOB (E15 / mlx-video diff): `wanLargeSeq` gates TWO mitigations — the fp32 SDPA
+/// upcast (in the attention modules) AND the per-block `eval` (in `WanModel`/branches). The NaN
+/// they mitigate was traced to the long-seq **fused-kernel dispatch race + lazy-graph buffer
+/// reuse**, for which the per-block `eval` (graph chaining) is the actual fix — so the fp32
+/// upcast may be REDUNDANT for correctness yet the memory/speed driver at large seqLen (fp32
+/// drops out of the fused flash kernel that mlx-video rides in bf16). This flag disables ONLY the
+/// upcast (per-block eval stays gated on `wanLargeSeq`), to run the bf16-fused path and discriminate
+/// whether fp32 is load-bearing. `WAN_FP32_SDPA=0` → bf16 SDPA at all seqLens (mlx-video's behavior);
+/// default (unset / non-"0") preserves the current fp32-upcast behavior. Decoupling matters: raising
+/// `wanLargeSeq` alone would ALSO turn off per-block eval and un-bound the graph.
+let wanForceFp32SdpaLargeSeq =
+    ProcessInfo.processInfo.environment["WAN_FP32_SDPA"].map { $0 != "0" } ?? true
+
 /// Compute sinusoidal positional embeddings.
 /// position: 1D [L] or 2D [B, L] -> [L, dim] or [B, L, dim].
 func sinusoidalEmbedding1d(_ dim: Int, _ position: MLXArray) -> MLXArray {
