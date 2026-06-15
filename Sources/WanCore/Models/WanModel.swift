@@ -29,7 +29,7 @@ public let wanLargeSeq = 1024
 /// whether fp32 is load-bearing. `WAN_FP32_SDPA=0` → bf16 SDPA at all seqLens (mlx-video's behavior);
 /// default (unset / non-"0") preserves the current fp32-upcast behavior. Decoupling matters: raising
 /// `wanLargeSeq` alone would ALSO turn off per-block eval and un-bound the graph.
-let wanForceFp32SdpaLargeSeq =
+public let wanForceFp32SdpaLargeSeq =
     ProcessInfo.processInfo.environment["WAN_FP32_SDPA"].map { $0 != "0" } ?? true
 
 /// Compute sinusoidal positional embeddings.
