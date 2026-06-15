@@ -136,14 +136,16 @@ class WanSelfAttention: Module {
             mask = paddingMask(seqLens: seqLens, total: s, dtype: qT.dtype)
         }
 
-        let out: MLXArray
-        if let mask {
-            out = MLXFast.scaledDotProductAttention(
-                queries: qT, keys: kT, values: vT, scale: scale, mask: mask)
-        } else {
-            out = MLXFast.scaledDotProductAttention(
-                queries: qT, keys: kT, values: vT, scale: scale, mask: nil)
-        }
+        // Metal bf16 self-attention is unstable at large seqLen → fp32 SDPA there (the
+        // QK^T/softmax-V chain; same house-style remedy WanVAE uses on the .cpu stream).
+        // Small seqLen stays bf16, bit-identical. Paired with per-block eval in WanModel.
+        let largeSeq = s >= wanLargeSeq
+        let (qS, kS, vS) = largeSeq
+            ? (qT.asType(.float32), kT.asType(.float32), vT.asType(.float32)) : (qT, kT, vT)
+        let out = MLXFast.scaledDotProductAttention(
+            queries: qS, keys: kS, values: vS, scale: scale,
+            mask: largeSeq ? mask?.asType(.float32) : mask
+        ).asType(wDtype)
 
         return o(out.transposed(0, 2, 1, 3).reshaped(b, s, -1))
     }

@@ -10,6 +10,15 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Sequence-length threshold above which the Metal bf16 attention path is unstable
+/// (nondeterministic NaNs / wrong values in the long-seq fused kernel + lazy-graph
+/// buffer reuse — mlx-swift 0.31.4, Apple Silicon). Above it we switch on two
+/// idiomatic mitigations: fp32 SDPA (in the attention modules) + per-block `eval`
+/// (in `WanModel`). Below it (t2i, low-res, the A14B-validated paths) nothing
+/// changes — the bf16 graph stays bit-identical. ~256² single-frame = seqLen 256
+/// (safe); 512²×17f = 1280 (the first observed failure), so the gate sits between.
+let wanLargeSeq = 1024
+
 /// Compute sinusoidal positional embeddings.
 /// position: 1D [L] or 2D [B, L] -> [L, dim] or [B, L, dim].
 func sinusoidalEmbedding1d(_ dim: Int, _ position: MLXArray) -> MLXArray {
@@ -336,7 +345,14 @@ public final class WanModel: Module, @unchecked Sendable {
             attnMask = paddingMask(seqLens: seqLensList, total: seqLen, dtype: wDtype)
         }
 
-        // Run transformer blocks
+        // Run transformer blocks. At large sequence length (multi-frame video on the
+        // GPU), bf16 attention on Metal is numerically unstable — see `wanLargeSeq`:
+        // we `eval` after each block to BOUND the lazy graph (mlx-lm-idiomatic graph-size
+        // control) which also resets MLX's Metal buffer-reuse, suppressing the
+        // nondeterministic long-seq NaN. Paired with fp32 SDPA in the attention modules.
+        // Small-seq paths (t2i, low-res, A14B-validated) keep the unbounded bf16 graph,
+        // so they stay bit-identical. (`WANCORE_DEBUG_NAN` adds a finiteness probe.)
+        let evalEachBlock = x.dim(1) >= wanLargeSeq
         let debugNaN = ProcessInfo.processInfo.environment["WANCORE_DEBUG_NAN"] != nil
         for (i, block) in blocks.enumerated() {
             let kv = crossKVCaches?[i]
@@ -344,9 +360,9 @@ public final class WanModel: Module, @unchecked Sendable {
                 x, e: e0, seqLens: seqLensList, gridSizes: gridSizes, freqs: freqs,
                 context: contextBatch, contextLens: nil, crossKVCache: kv,
                 ropeCosSin: ropeCosSin, attnMask: attnMask)
-            if debugNaN {
+            if evalEachBlock || debugNaN {
                 eval(x)
-                if !x.abs().max().item(Float.self).isFinite {
+                if debugNaN, !x.abs().max().item(Float.self).isFinite {
                     print("[WANCORE_DEBUG_NAN] first non-finite after block \(i)")
                     break
                 }
