@@ -29,5 +29,14 @@ let package = Package(
             ],
             path: "Sources/WanCore"
         ),
+        .testTarget(
+            name: "WanCoreTests",
+            dependencies: [
+                "WanCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/WanCoreTests"
+        ),
     ]
 )
