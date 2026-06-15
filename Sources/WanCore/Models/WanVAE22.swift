@@ -136,3 +136,113 @@ public final class AvgDown3D: Module, @unchecked Sendable {
         return x.mean(axis: -1)
     }
 }
+
+// MARK: - V22CausalConv3d (channels-LAST)
+
+/// 3D causal convolution, channels-last [B,T,H,W,C]. 1:1 port of vae22.py
+/// `CausalConv3d` — decomposes the 3D conv into per-frame 2D convs (the oracle's
+/// memory pattern). NOTE: vae22's causal temporal pad is `2*padding[0]` (NOT the
+/// 16-ch `k-stride`), so this is a distinct class from the 16-ch `CausalConv3d`.
+/// Weight `[O, kd, kh, kw, I]`.
+public final class V22CausalConv3d: Module, @unchecked Sendable {
+    public let kernelSize: (Int, Int, Int)
+    public let stride: (Int, Int, Int)
+    let causalPadT: Int
+    let padH: Int
+    let padW: Int
+    public let weight: MLXArray
+    public let bias: MLXArray
+
+    public init(
+        _ inChannels: Int, _ outChannels: Int, _ kernelSize: (Int, Int, Int),
+        stride: (Int, Int, Int) = (1, 1, 1), padding: (Int, Int, Int) = (0, 0, 0)
+    ) {
+        self.kernelSize = kernelSize
+        self.stride = stride
+        self.causalPadT = 2 * padding.0
+        self.padH = padding.1
+        self.padW = padding.2
+        self.weight = MLXArray.zeros(
+            [outChannels, kernelSize.0, kernelSize.1, kernelSize.2, inChannels])
+        self.bias = MLXArray.zeros([outChannels])
+        super.init()
+    }
+
+    /// Scalar kernel/padding spelling (vae22's `CausalConv3d(in, out, 3, padding=1)`).
+    public convenience init(_ inC: Int, _ outC: Int, _ k: Int, stride: Int = 1, padding: Int = 0) {
+        self.init(inC, outC, (k, k, k), stride: (stride, stride, stride),
+                  padding: (padding, padding, padding))
+    }
+
+    /// x: [B, T, H, W, C]. `cacheX` = prev-chunk trailing frames (chunked/streaming).
+    public func callAsFunction(_ input: MLXArray, cacheX: MLXArray? = nil) -> MLXArray {
+        var x = input
+        let b = x.dim(0)
+        let c = x.dim(4)
+        let (kd, kh, kw) = kernelSize
+
+        // 1×1×1 fast path: pointwise conv over the channel axis, per frame.
+        if kd == 1 && kh == 1 && kw == 1 {
+            let t = x.dim(1)
+            let (h, w) = (x.dim(2), x.dim(3))
+            let xFlat = x.reshaped(b * t, h, w, c)
+            let w2d = weight[0..., 0, 0..., 0..., 0...]  // [O, 1, 1, I]
+            let y = conv2d(xFlat, w2d) + bias
+            return y.reshaped(b, t, y.dim(1), y.dim(2), -1)
+        }
+
+        // Causal temporal pad (prepend cached frames, then zero-pad the remainder).
+        var padNeeded = causalPadT
+        if let cacheX, padNeeded > 0 {
+            x = concatenated([cacheX, x], axis: 1)
+            padNeeded -= cacheX.dim(1)
+        }
+        if padNeeded > 0 {
+            let padT = MLXArray.zeros([b, padNeeded, x.dim(2), x.dim(3), c], dtype: x.dtype)
+            x = concatenated([padT, x], axis: 1)
+        }
+        // Spatial pad.
+        if padH > 0 || padW > 0 {
+            x = padded(x, widths: [.init((0, 0)), .init((0, 0)), .init((padH, padH)),
+                                   .init((padW, padW)), .init((0, 0))])
+        }
+
+        let tPadded = x.dim(1)
+        let tOut = (tPadded - kd) / stride.0 + 1
+        // Decompose 3D conv into a sum of per-temporal-position 2D convs.
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(tOut)
+        for t in 0..<tOut {
+            let tStart = t * stride.0
+            var accum: MLXArray? = nil
+            for d in 0..<kd {
+                let frame = x[0..., tStart + d]        // [B, Hp, Wp, C]
+                let w2d = weight[0..., d, 0..., 0..., 0...]  // [O, kh, kw, I]
+                let convOut = conv2d(frame, w2d, stride: .init((stride.1, stride.2)))
+                accum = accum == nil ? convOut : accum! + convOut
+            }
+            outputs.append(accum! + bias)
+        }
+        return stacked(outputs, axis: 1)  // [B, T_out, H_out, W_out, O]
+    }
+}
+
+// MARK: - V22RMSNorm (channels-LAST)
+
+/// vae22.py `RMS_norm` — actually F.normalize (L2 over the channel axis) × scale ×
+/// gamma, channels-last. Distinct from the 16-ch `RMS_norm` (layout/idiom).
+public final class V22RMSNorm: Module, @unchecked Sendable {
+    public let scale: Float
+    public let gamma: MLXArray
+
+    public init(_ dim: Int) {
+        self.scale = Float(Double(dim).squareRoot())
+        self.gamma = MLXArray.ones([dim])
+        super.init()
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let l2sq = (x * x).sum(axis: -1, keepDims: true)
+        return x * rsqrt(maximum(l2sq, MLXArray(Float(1e-24)))) * scale * gamma
+    }
+}
