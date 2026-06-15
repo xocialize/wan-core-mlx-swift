@@ -178,6 +178,14 @@ public func decodeStreaming22(
         // chunk's freed buffers (alias/go stale past 2 chunks).
         eval([oc] + fc.slots.compactMap { $0 })
         outs.append(oc)
+        // Return THIS chunk's transient intermediates (the full-res 1024-ch conv working
+        // set — the decode's dominant, spatial-driven allocation) to the OS before the
+        // next chunk. Without this the freed-but-cached buffers stack into a high-water
+        // ~N_chunks × one-chunk-working-set, which is the decode-internal phys_footprint
+        // gap the int4/PAGE_DIT runs isolated. The referenced survivors (oc in `outs`, the
+        // carried `fc` slots just eval'd above) are kept; only dead cache is reclaimed, so
+        // the result stays bit-identical. Bounds the decode high-water to ~one chunk.
+        MLX.GPU.clearCache()
         start += chunkLat
     }
     let video = unpatchify22(concatenated(outs, axis: 1))
