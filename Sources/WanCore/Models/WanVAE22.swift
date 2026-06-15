@@ -12,6 +12,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXNN
 
 // MARK: - Per-channel latent normalization (z_dim=48)
@@ -244,5 +245,237 @@ public final class V22RMSNorm: Module, @unchecked Sendable {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let l2sq = (x * x).sum(axis: -1, keepDims: true)
         return x * rsqrt(maximum(l2sq, MLXArray(Float(1e-24)))) * scale * gamma
+    }
+}
+
+// MARK: - V22ResidualBlock (channels-LAST)
+
+/// The Sequential layers inside a vae22 ResidualBlock (channels-last). PyTorch
+/// nn.Sequential indices 0/2/3/6 = RMS_norm / CausalConv3d / RMS_norm / CausalConv3d
+/// (1,4 = SiLU, 5 = Dropout — no params). Named `layer_N` to match the checkpoint
+/// keys. Reuses the shared `CACHE_T` / `FeatCache` / `FeatIdx` (layout-agnostic).
+public final class V22ResidualBlockLayers: Module, @unchecked Sendable {
+    @ModuleInfo(key: "layer_0") public var layer0: V22RMSNorm
+    @ModuleInfo(key: "layer_2") public var layer2: V22CausalConv3d
+    @ModuleInfo(key: "layer_3") public var layer3: V22RMSNorm
+    @ModuleInfo(key: "layer_6") public var layer6: V22CausalConv3d
+
+    public init(_ inDim: Int, _ outDim: Int) {
+        self._layer0.wrappedValue = V22RMSNorm(inDim)
+        self._layer2.wrappedValue = V22CausalConv3d(inDim, outDim, 3, padding: 1)
+        self._layer3.wrappedValue = V22RMSNorm(outDim)
+        self._layer6.wrappedValue = V22CausalConv3d(outDim, outDim, 3, padding: 1)
+        super.init()
+    }
+
+    /// CausalConv3d with temporal feature-caching for chunked decode (axis 1 = T).
+    private func convCached(_ conv: V22CausalConv3d, _ x: MLXArray, _ fc: FeatCache, _ fi: FeatIdx)
+        -> MLXArray
+    {
+        let idx = fi.value
+        var cacheX = x[0..., Swift.max(0, x.dim(1) - CACHE_T)...]
+        if cacheX.dim(1) < 2, let cached = fc[idx] {
+            cacheX = concatenated([cached[0..., (cached.dim(1) - 1)...], cacheX], axis: 1)
+        }
+        let out = conv(x, cacheX: fc[idx])  // fc[idx]=nil first chunk → zero-pad
+        fc[idx] = cacheX
+        fi.value += 1
+        return out
+    }
+
+    public func callAsFunction(
+        _ x0: MLXArray, featCache: FeatCache? = nil, featIdx: FeatIdx? = nil
+    ) -> MLXArray {
+        var x = layer0(x0)
+        x = silu(x)
+        if let fc = featCache, let fi = featIdx { x = convCached(layer2, x, fc, fi) }
+        else { x = layer2(x) }
+        eval(x)  // eval between convs to bound graph size (vae22.py mx.eval)
+        x = layer3(x)
+        x = silu(x)
+        if let fc = featCache, let fi = featIdx { x = convCached(layer6, x, fc, fi) }
+        else { x = layer6(x) }
+        return x
+    }
+}
+
+/// vae22 ResidualBlock: `residual` path + a 1×1 `shortcut` conv when dims change.
+public final class V22ResidualBlock: Module, @unchecked Sendable {
+    @ModuleInfo(key: "residual") public var residual: V22ResidualBlockLayers
+    @ModuleInfo(key: "shortcut") public var shortcut: V22CausalConv3d?
+
+    public init(_ inDim: Int, _ outDim: Int) {
+        self._residual.wrappedValue = V22ResidualBlockLayers(inDim, outDim)
+        self._shortcut.wrappedValue = inDim != outDim ? V22CausalConv3d(inDim, outDim, 1) : nil
+        super.init()
+    }
+
+    public func callAsFunction(
+        _ x: MLXArray, featCache: FeatCache? = nil, featIdx: FeatIdx? = nil
+    ) -> MLXArray {
+        let h = shortcut.map { $0(x) } ?? x
+        return residual(x, featCache: featCache, featIdx: featIdx) + h
+    }
+}
+
+// MARK: - V22AttentionBlock (channels-LAST, 2D self-attn per frame)
+
+/// vae22.py `AttentionBlock` — single-head 2D self-attention applied per frame.
+/// QKV/proj are raw 1×1 conv params (`to_qkv_weight`/`proj_weight`, NOT Conv2d
+/// submodules) to match the checkpoint keys. SDPA forced to the `.cpu` stream for
+/// strict fp32 (donor lesson L10 — Metal loses ~3-4 bits on the QK^T/softmax-V chain).
+public final class V22AttentionBlock: Module, @unchecked Sendable {
+    public let dim: Int
+    @ModuleInfo(key: "norm") public var norm: V22RMSNorm
+    @ParameterInfo(key: "to_qkv_weight") public var toQkvWeight: MLXArray
+    @ParameterInfo(key: "to_qkv_bias") public var toQkvBias: MLXArray
+    @ParameterInfo(key: "proj_weight") public var projWeight: MLXArray
+    @ParameterInfo(key: "proj_bias") public var projBias: MLXArray
+
+    public init(_ dim: Int) {
+        self.dim = dim
+        self._norm.wrappedValue = V22RMSNorm(dim)
+        self._toQkvWeight.wrappedValue = MLXArray.zeros([3 * dim, 1, 1, dim])
+        self._toQkvBias.wrappedValue = MLXArray.zeros([3 * dim])
+        self._projWeight.wrappedValue = MLXArray.zeros([dim, 1, 1, dim])
+        self._projBias.wrappedValue = MLXArray.zeros([dim])
+        super.init()
+    }
+
+    /// x: [B, T, H, W, C].
+    public func callAsFunction(_ x0: MLXArray) -> MLXArray {
+        let (b, t, h, w, c) = (x0.dim(0), x0.dim(1), x0.dim(2), x0.dim(3), x0.dim(4))
+        let identity = x0
+        var x = x0.reshaped(b * t, h, w, c)
+        x = norm(x)
+        // 1×1 conv = linear over channels: [BT,H,W,C] → [BT,H,W,3C].
+        let qkv = (conv2d(x, toQkvWeight) + toQkvBias).reshaped(b * t, h * w, 3 * c)
+        let parts = split(qkv, parts: 3, axis: -1)  // each [BT, HW, C]
+        let q = parts[0][0..., .newAxis, 0..., 0...]  // [BT, 1, HW, C]
+        let k = parts[1][0..., .newAxis, 0..., 0...]
+        let v = parts[2][0..., .newAxis, 0..., 0...]
+        var out = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v,
+            scale: Float(pow(Double(c), -0.5)), mask: nil, stream: .cpu)
+        out = out.squeezed(axis: 1).reshaped(b * t, h, w, c)
+        out = conv2d(out, projWeight) + projBias
+        return out.reshaped(b, t, h, w, c) + identity
+    }
+}
+
+// MARK: - V22Resample (channels-LAST spatial ± temporal up/downsample)
+
+/// vae22.py `Resample` — nearest-neighbor 2× spatial up/down with optional temporal
+/// up/down via a `time_conv` CausalConv3d. `resample_weight`/`resample_bias` are raw
+/// 3×3 Conv2d params. Spatial pass is chunked (8 frames) with an `eval` per chunk to
+/// bound graph size (the watchdog lever). The E11 first-chunk temporal-upsample skip
+/// lives in the `upsample3d` branch.
+public final class V22Resample: Module, @unchecked Sendable {
+    public let dim: Int
+    public let mode: String
+    @ParameterInfo(key: "resample_weight") public var resampleWeight: MLXArray
+    @ParameterInfo(key: "resample_bias") public var resampleBias: MLXArray
+    @ModuleInfo(key: "time_conv") public var timeConv: V22CausalConv3d?
+
+    public init(_ dim: Int, mode: String) {
+        self.dim = dim
+        self.mode = mode
+        self._resampleWeight.wrappedValue = MLXArray.zeros([dim, 3, 3, dim])
+        self._resampleBias.wrappedValue = MLXArray.zeros([dim])
+        switch mode {
+        case "upsample3d":
+            self._timeConv.wrappedValue = V22CausalConv3d(dim, dim * 2, (3, 1, 1), padding: (1, 0, 0))
+        case "downsample3d":
+            self._timeConv.wrappedValue = V22CausalConv3d(
+                dim, dim, (3, 1, 1), stride: (2, 1, 1), padding: (0, 0, 0))
+        default:
+            self._timeConv.wrappedValue = nil
+        }
+        super.init()
+    }
+
+    /// Nearest-neighbor 2× spatial upsample. x: [N, H, W, C].
+    private func upsample2x(_ x: MLXArray) -> MLXArray {
+        repeated(repeated(x, count: 2, axis: 1), count: 2, axis: 2)
+    }
+    /// 3×3 Conv2d with symmetric padding=1. x: [N, H, W, C].
+    private func conv2dPad1(_ x: MLXArray) -> MLXArray {
+        let xp = padded(x, widths: [.init((0, 0)), .init((1, 1)), .init((1, 1)), .init((0, 0))])
+        return conv2d(xp, resampleWeight) + resampleBias
+    }
+    /// Strided 3×3 Conv2d for downsampling — ZeroPad2d((0,1,0,1)) then stride 2.
+    private func downsampleConv2d(_ x: MLXArray) -> MLXArray {
+        let xp = padded(x, widths: [.init((0, 0)), .init((0, 1)), .init((0, 1)), .init((0, 0))])
+        return conv2d(xp, resampleWeight, stride: .init((2, 2))) + resampleBias
+    }
+
+    /// x: [B, T, H, W, C].
+    public func callAsFunction(
+        _ input: MLXArray, firstChunk: Bool = false,
+        featCache: FeatCache? = nil, featIdx: FeatIdx? = nil
+    ) -> MLXArray {
+        var x = input
+        let b = x.dim(0)
+        var t = x.dim(1)
+        let (h, w, c) = (x.dim(2), x.dim(3), x.dim(4))
+
+        // --- Temporal upsample (before spatial) ---
+        if mode == "upsample3d", let tc = timeConv {
+            if firstChunk && t > 1 {
+                let firstFrame = x[0..., 0..<1]
+                let tcOut = tc(x[0..., 1...]).reshaped(b, t - 1, h, w, 2, c)
+                let stream0 = tcOut[0..., 0..., 0..., 0..., 0, 0...]
+                let stream1 = tcOut[0..., 0..., 0..., 0..., 1, 0...]
+                let interleaved = stacked([stream0, stream1], axis: 2)
+                    .reshaped(b, (t - 1) * 2, h, w, c)
+                x = concatenated([firstFrame, interleaved], axis: 1)
+            } else {
+                let tcOut = tc(x).reshaped(b, t, h, w, 2, c)
+                let stream0 = tcOut[0..., 0..., 0..., 0..., 0, 0...]
+                let stream1 = tcOut[0..., 0..., 0..., 0..., 1, 0...]
+                x = stacked([stream0, stream1], axis: 2).reshaped(b, t * 2, h, w, c)
+            }
+            eval(x)
+            t = x.dim(1)
+        }
+
+        // --- Spatial up/down (chunked for upsample) ---
+        if mode == "upsample2d" || mode == "upsample3d" {
+            var chunks: [MLXArray] = []
+            var tStart = 0
+            while tStart < t {
+                let tEnd = Swift.min(tStart + 8, t)
+                var xc = x[0..., tStart..<tEnd].reshaped(-1, h, w, c)
+                xc = conv2dPad1(upsample2x(xc))
+                eval(xc)
+                chunks.append(xc)
+                tStart += 8
+            }
+            x = concatenated(chunks, axis: 0)
+            x = x.reshaped(b, t, x.dim(1), x.dim(2), c)
+        } else if mode == "downsample2d" || mode == "downsample3d" {
+            let xf = downsampleConv2d(x.reshaped(b * t, h, w, c))
+            eval(xf)
+            x = xf.reshaped(b, t, xf.dim(1), xf.dim(2), c)
+        }
+
+        // --- Temporal downsample (after spatial) ---
+        if mode == "downsample3d", let tc = timeConv {
+            if let fc = featCache, let fi = featIdx {
+                let idx = fi.value
+                if let cached = fc[idx] {
+                    let saveX = x[0..., (x.dim(1) - 1)...]
+                    x = tc(concatenated([cached[0..., (cached.dim(1) - 1)...], x], axis: 1))
+                    fc[idx] = saveX
+                } else {
+                    fc[idx] = x  // first chunk: store, skip time_conv
+                }
+                fi.value += 1
+            } else if t > 1 {
+                x = tc(x)
+            }
+            eval(x)
+        }
+        return x
     }
 }
