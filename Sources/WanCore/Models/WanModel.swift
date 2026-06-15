@@ -17,7 +17,7 @@ import MLXNN
 /// (in `WanModel`). Below it (t2i, low-res, the A14B-validated paths) nothing
 /// changes — the bf16 graph stays bit-identical. ~256² single-frame = seqLen 256
 /// (safe); 512²×17f = 1280 (the first observed failure), so the gate sits between.
-let wanLargeSeq = 1024
+public let wanLargeSeq = 1024
 
 /// Compute sinusoidal positional embeddings.
 /// position: 1D [L] or 2D [B, L] -> [L, dim] or [B, L, dim].
