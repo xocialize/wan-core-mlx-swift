@@ -145,6 +145,24 @@ final class WanVAE22ParityTests: XCTestCase {
         }
     }
 
+    /// Streaming (temporal-chunked) decode must be BIT-IDENTICAL to the whole-sequence
+    /// decode. z_denorm is 3 latent frames → chunkLat=1 runs 3 chunks, exercising the
+    /// first-chunk Rep skip + 2 cached chunks (the >2-chunk aliasing case).
+    func testStreamingDecodeMatchesWholeSeq() throws {
+        try requireFixtures()
+        try Device.withDefaultDevice(Device(.cpu)) {
+            let decoder = try loadDecoder()
+            let zDenorm = try loadNumpy(url: parityDir.appendingPathComponent("z_denorm.npy"))
+            let videoGolden = try loadNumpy(url: parityDir.appendingPathComponent("video.npy"))
+            let streamed = decodeStreaming22(decoder, zDenorm, chunkLat: 1)
+            eval(streamed)
+            XCTAssertEqual(streamed.shape, videoGolden.shape, "streamed shape mismatch")
+            let maxd = maxAbsDiff(streamed, videoGolden)
+            print("[vae22 streaming] chunkLat=1 vs whole-seq golden: max-abs=\(maxd) shape=\(streamed.shape)")
+            XCTAssertLessThan(maxd, 1e-4, "streaming decode max-abs \(maxd)")
+        }
+    }
+
     /// Stage bisector (diagnostic): replicate the oracle's staged decode and print
     /// the per-stage max/mean vs `st_*.npy`. Stages are ≤6e-5 until the first
     /// big-spatial conv; useful for localizing any future regression.
