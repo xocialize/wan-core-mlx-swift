@@ -56,6 +56,54 @@ final class WanVAE22ParityTests: XCTestCase {
         return decoder
     }
 
+    /// Load the encoder + top-level conv1 weights into a fresh encoder, verifying the
+    /// module tree matches the (already-sanitized) checkpoint exactly. CPU stream caller.
+    private func loadEncoder() throws -> Wan22VAEEncoder {
+        let encoder = Wan22VAEEncoder(zDim: 48)
+        let weights = try WeightLoader.loadSafetensors(url: vaeWeights)
+            .filter { $0.key.hasPrefix("encoder.") || $0.key.hasPrefix("conv1.") }
+            .mapValues { $0.asType(.float32) }
+        try encoder.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        eval(encoder.parameters())
+        return encoder
+    }
+
+    /// Pure gate: `patchify22(img)` must reproduce the oracle `_patchify`.
+    func testPatchifyMatchesGolden() throws {
+        try requireFixtures()
+        if !FileManager.default.fileExists(atPath: parityDir.appendingPathComponent("enc_img.npy").path) {
+            throw XCTSkip("encoder fixtures not present")
+        }
+        let img = try loadNumpy(url: parityDir.appendingPathComponent("enc_img.npy"))
+        let patchedG = try loadNumpy(url: parityDir.appendingPathComponent("enc_patched.npy"))
+        let patched = patchify22(img)
+        eval(patched)
+        XCTAssertEqual(patched.shape, patchedG.shape)
+        XCTAssertLessThan(maxAbsDiff(patched, patchedG), 1e-6)
+    }
+
+    /// Full encode gate: encode the fixed video on the CPU stream → normalized mu;
+    /// compare to the oracle golden. Bit-exact in practice (see class doc).
+    func testEncodeMatchesGolden() throws {
+        try requireFixtures()
+        if !FileManager.default.fileExists(atPath: parityDir.appendingPathComponent("enc_mu.npy").path) {
+            throw XCTSkip("encoder fixtures not present")
+        }
+        try Device.withDefaultDevice(Device(.cpu)) {
+            let encoder = try loadEncoder()
+            let img = try loadNumpy(url: parityDir.appendingPathComponent("enc_img.npy"))
+            let muGolden = try loadNumpy(url: parityDir.appendingPathComponent("enc_mu.npy"))
+            let mu = encoder(img)
+            eval(mu)
+            XCTAssertEqual(mu.shape, muGolden.shape, "encoded mu shape mismatch")
+            let maxd = maxAbsDiff(mu, muGolden)
+            let meand = meanAbsDiff(mu, muGolden)
+            print("[vae22 parity] encode max-abs=\(maxd) mean-abs=\(meand) shape \(mu.shape)")
+            XCTAssertLessThan(meand, 1e-5, "vae22 encode mean-abs \(meand)")
+            XCTAssertLessThan(maxd, 1e-3, "vae22 encode max-abs \(maxd)")
+        }
+    }
+
     /// Constant gate: the Swift 48-vec mean/std match the oracle's.
     func testStatsConstantsMatchGolden() throws {
         try requireFixtures()
