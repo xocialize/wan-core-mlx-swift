@@ -337,12 +337,20 @@ public final class WanModel: Module, @unchecked Sendable {
         }
 
         // Run transformer blocks
+        let debugNaN = ProcessInfo.processInfo.environment["WANCORE_DEBUG_NAN"] != nil
         for (i, block) in blocks.enumerated() {
             let kv = crossKVCaches?[i]
             x = block(
                 x, e: e0, seqLens: seqLensList, gridSizes: gridSizes, freqs: freqs,
                 context: contextBatch, contextLens: nil, crossKVCache: kv,
                 ropeCosSin: ropeCosSin, attnMask: attnMask)
+            if debugNaN {
+                eval(x)
+                if !x.abs().max().item(Float.self).isFinite {
+                    print("[WANCORE_DEBUG_NAN] first non-finite after block \(i)")
+                    break
+                }
+            }
         }
 
         // Output head
