@@ -7,12 +7,20 @@ import Foundation
 import MLX
 import Tokenizers
 
-/// Clean text matching the official Wan2.2 tokenizer preprocessing: double
-/// HTML unescape + whitespace normalization. (Upstream also applies
-/// ftfy.fix_text when installed — a mojibake repair that is a no-op on
-/// well-formed UTF-8 input; not ported.)
-func cleanText(_ text: String) -> String {
-    var t = text
+/// Clean text matching the official Wan2.2 tokenizer preprocessing (`_clean_text`):
+/// ftfy.fix_text → double HTML unescape → whitespace normalization.
+///
+/// ftfy's load-bearing step for Wan is its NFKC compatibility normalization
+/// (fullwidth → halfwidth). This is **CRITICAL for the Chinese `sample_neg_prompt`**:
+/// without it, fullwidth punctuation (e.g. `，` U+FF0C → `,` U+002C) tokenizes
+/// differently, producing a wrong UNCOND context — and at guide-scale 5 the CFG term
+/// `cond − uncond` amplifies that garbage every step, blowing up the latent in the
+/// low-noise tail (the multi-frame divergence). NFKC reproduces ftfy's mapping for
+/// this string exactly and is a no-op on ASCII prompts (so the positive prompt is
+/// unchanged). The remaining ftfy fixes (mojibake repair, quote uncurling) are no-ops
+/// on well-formed input and are not ported.
+public func cleanText(_ text: String) -> String {
+    var t = text.precomposedStringWithCompatibilityMapping  // NFKC (≈ ftfy width fix)
     for _ in 0..<2 {
         t = CFXMLCreateStringByUnescapingEntities(nil, t as CFString, nil) as String
     }
