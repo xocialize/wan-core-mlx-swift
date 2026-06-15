@@ -5,6 +5,34 @@
 
 import Foundation
 
+/// Decodes a JSON field that is EITHER a scalar number OR an array of numbers into
+/// `[Double]`, transparently — so consumers still see `[Double]`. Wan2.2 ships both
+/// shapes for `sample_guide_scale`: A14B is `[high, low]` (dual expert), TI2V-5B is a
+/// bare `5.0` (single expert). Encodes back as a scalar when there's exactly one value.
+@propertyWrapper
+public struct ScalarOrArrayDouble: Codable, Sendable, Equatable {
+    public var wrappedValue: [Double]
+    public init(wrappedValue: [Double]) { self.wrappedValue = wrappedValue }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let scalar = try? c.decode(Double.self) {
+            wrappedValue = [scalar]
+        } else {
+            wrappedValue = try c.decode([Double].self)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        if wrappedValue.count == 1 {
+            try c.encode(wrappedValue[0])
+        } else {
+            try c.encode(wrappedValue)
+        }
+    }
+}
+
 public struct WanQuantization: Codable, Sendable, Equatable {
     public var groupSize: Int
     public var bits: Int
@@ -38,7 +66,7 @@ public struct WanConfig: Codable, Sendable, Equatable {
     public var boundary: Double
     public var sampleShift: Double
     public var sampleSteps: Int
-    public var sampleGuideScale: [Double]
+    @ScalarOrArrayDouble public var sampleGuideScale: [Double]
     public var numTrainTimesteps: Int
     public var sampleFps: Int
     public var frameNum: Int
