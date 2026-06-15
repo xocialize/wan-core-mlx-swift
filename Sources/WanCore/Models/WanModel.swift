@@ -98,7 +98,10 @@ public enum WanTextContext {
 }
 
 /// Wan2.2 diffusion backbone for text-to-video generation.
-public final class WanModel: Module, @unchecked Sendable {
+// `open` so adapter consumers IN OTHER PACKAGES (VACE Context Adapter, future ControlNet/T2I-Adapter)
+// can subclass to add a parallel branch + use the embed/runBlocks(blockResiduals:)/finish seam, with
+// the inherited backbone keys staying unprefixed (so the standard converted weights load unchanged).
+open class WanModel: Module, @unchecked Sendable {
     let config: WanConfig
     public let dim: Int
     let numHeads: Int

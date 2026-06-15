@@ -8,7 +8,8 @@ import MLX
 import MLXNN
 
 /// Wan transformer block with learned modulation, self-attn, cross-attn, and FFN.
-public class WanAttentionBlock: Module {
+/// `open` so adapter consumers in other packages (VACE `VaceWanAttentionBlock`) can subclass it.
+open class WanAttentionBlock: Module {
     @ModuleInfo(key: "norm1") var norm1: WanLayerNorm
     @ModuleInfo(key: "self_attn") var selfAttn: WanSelfAttention
     @ModuleInfo(key: "norm3") var norm3: WanLayerNorm?
@@ -18,7 +19,8 @@ public class WanAttentionBlock: Module {
     /// Learned modulation: 6 vectors for scale/shift/gate (kept in float32).
     let modulation: MLXArray
 
-    init(
+    // public so adapter consumers (VACE `VaceWanAttentionBlock`) can subclass + `super.init(...)`.
+    public init(
         dim: Int,
         ffnDim: Int,
         numHeads: Int,
