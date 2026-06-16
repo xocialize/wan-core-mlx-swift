@@ -9,6 +9,7 @@
 // is cheap. Bit-identical to `vae.encode(x)` (eval only materializes; the per-chunk featCache
 // materialization is the same staleness fix `decodeStreaming` uses).
 
+import Foundation
 import MLX
 
 /// Temporal-chunked encode. x: video [B, 3, T, H, W] in [-1, 1] ->
@@ -34,6 +35,14 @@ public func encodeStreaming(vae: WanVAE, _ x: MLXArray) -> MLXArray {
         // chunk's freed buffers, which alias/go stale across the boundary (same fix as decode).
         eval([oc] + fc.slots.compactMap { $0 })
         outs.append(oc)
+        // Per-chunk progress (E15 Addendum 10): proves chunking ENGAGES (chunk i/N progressing
+        // = linear, NOT a loop) and shows the per-chunk active/cache cost. `WAN_VAE_LOG=1`.
+        if ProcessInfo.processInfo.environment["WAN_VAE_LOG"] != nil {
+            let s = Memory.snapshot()
+            func gb(_ b: Int) -> String { String(format: "%.1f", Double(b) / 1e9) }
+            print("[WanVAE encode] chunk \(i + 1)/\(numChunks) (frames \(chunk.dim(2))): "
+                + "active=\(gb(s.activeMemory)) cache=\(gb(s.cacheMemory)) peak=\(gb(s.peakMemory)) GB")
+        }
     }
 
     let out = concatenated(outs, axis: 2)
