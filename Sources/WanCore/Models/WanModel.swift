@@ -410,8 +410,26 @@ open class WanModel: Module, @unchecked Sendable {
         // unbounded bf16 graph, so they stay bit-identical. (`WANCORE_DEBUG_NAN` adds a probe.)
         let evalEachBlock = s.x.dim(1) >= wanLargeSeq
         let debugNaN = ProcessInfo.processInfo.environment["WANCORE_DEBUG_NAN"] != nil
+        // Opt-in fine per-block attribution (`WAN_PROFILE_DEEP=blocks`). Forces a per-block eval
+        // even when `evalEachBlock` is false (so it works at small seqLen too) — this OVERSTATES
+        // wall-clock vs production (the original graph overlaps), so it is for relative attribution,
+        // not absolute timing. At large seqLen the per-block eval is already on, so distortion is nil.
+        let profBlocks = WanProfiler.shared.deepEnabled("blocks")
+        let blockNote = "seqLen=\(s.x.dim(1)) B=\(s.x.dim(0))"
         for (i, block) in blocks.enumerated() {
             let kv = crossKVCaches?[i]
+            if profBlocks {
+                // NB: keep this block invocation identical to the un-profiled one below.
+                _ = WanProfiler.shared.barrier("blocks", "block", index: i, note: blockNote) { () -> MLXArray in
+                    s.x = block(
+                        s.x, e: s.e0, seqLens: s.seqLensList, gridSizes: s.gridSizes, freqs: freqs,
+                        context: s.contextBatch, contextLens: nil, crossKVCache: kv,
+                        ropeCosSin: ropeCosSin, attnMask: s.attnMask)
+                    if let r = blockResiduals?[i] { s.x = s.x + r }
+                    return s.x
+                }
+                continue
+            }
             s.x = block(
                 s.x, e: s.e0, seqLens: s.seqLensList, gridSizes: s.gridSizes, freqs: freqs,
                 context: s.contextBatch, contextLens: nil, crossKVCache: kv,

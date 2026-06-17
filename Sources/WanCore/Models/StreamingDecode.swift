@@ -175,11 +175,18 @@ public func decodeStreaming(
         let zc = z[0..., 0..., start..<Swift.min(start + chunkLat, tLat)]
         let xc = vae.conv2(zc)  // kernel-1, per-frame, no cache
         let fi = FeatIdx()
-        let oc = decoderChunk(vae.decoder, xc, fc, fi, first: first, single: single)
-        // Materialize the carried cache too — else fc holds lazy slice-views
-        // into this chunk's freed buffers, which alias/go stale across the
-        // boundary (fails at >2 chunks).
-        eval([oc] + fc.slots.compactMap { $0 })
+        // Per-chunk visibility: region times this chunk (bounded by the eval below) and stamps
+        // active/cache/phys → `[WANPROF] decode,chunk,N,ms,…`. One run tells us whether per-chunk
+        // wall-time and phys are flat (streaming working) or growing (reclaim broken on this stream),
+        // separating "CPU is just slow" from "streaming isn't streaming." No-op when profiling off.
+        let oc = WanProfiler.shared.region("decode", "chunk", index: start) { () -> MLXArray in
+            let oc = decoderChunk(vae.decoder, xc, fc, fi, first: first, single: single)
+            // Materialize the carried cache too — else fc holds lazy slice-views
+            // into this chunk's freed buffers, which alias/go stale across the
+            // boundary (fails at >2 chunks).
+            eval([oc] + fc.slots.compactMap { $0 })
+            return oc
+        }
         outs.append(oc)
         start += chunkLat
     }

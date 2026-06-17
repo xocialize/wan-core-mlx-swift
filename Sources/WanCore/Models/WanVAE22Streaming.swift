@@ -185,7 +185,7 @@ public func decodeStreaming22(
         // gap the int4/PAGE_DIT runs isolated. The referenced survivors (oc in `outs`, the
         // carried `fc` slots just eval'd above) are kept; only dead cache is reclaimed, so
         // the result stays bit-identical. Bounds the decode high-water to ~one chunk.
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
         start += chunkLat
     }
     let video = unpatchify22(concatenated(outs, axis: 1))

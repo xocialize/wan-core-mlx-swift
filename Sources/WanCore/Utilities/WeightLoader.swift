@@ -286,7 +286,7 @@ public enum WeightLoader {
                 uniqueKeysWithValues: flat.map {
                     ($0.0, MLXArray.zeros($0.1.shape, dtype: $0.1.dtype))
                 })
-            try? model.update(parameters: ModuleParameters.unflattened(zeroed))
+            model.update(parameters: ModuleParameters.unflattened(zeroed))
             // Do NOT eval the zeros: constant-fill graphs have no slow
             // dependencies (no fence stall), and every value is replaced by
             // the loaded tensors before anything evaluates them. Eagerly
