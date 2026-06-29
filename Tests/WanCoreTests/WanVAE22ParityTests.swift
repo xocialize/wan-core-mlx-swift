@@ -163,6 +163,31 @@ final class WanVAE22ParityTests: XCTestCase {
         }
     }
 
+    /// Phase-2 gate: SPATIAL halo-tiled streaming decode must be BIT-IDENTICAL to both the
+    /// whole-seq golden AND the untiled (spatialTiles=1) streaming decode. The 128² golden
+    /// (suffix grid 64²) with spatialTiles=2 makes real 32+halo tiles (not a no-op), and the
+    /// 3 latent frames exercise the multi-chunk per-tile-cache (keepCache) path. The crop
+    /// (not blend) is the exactness guarantee — expect max-abs 0.0.
+    func testStreamingDecodeSpatialTiledMatchesWholeSeq() throws {
+        try requireFixtures()
+        try Device.withDefaultDevice(Device(.cpu)) {
+            let decoder = try loadDecoder()
+            let zDenorm = try loadNumpy(url: parityDir.appendingPathComponent("z_denorm.npy"))
+            let videoGolden = try loadNumpy(url: parityDir.appendingPathComponent("video.npy"))
+
+            let untiled = decodeStreaming22(decoder, zDenorm, chunkLat: 1, spatialTiles: 1)
+            let tiled = decodeStreaming22(decoder, zDenorm, chunkLat: 1, spatialTiles: 2)
+            eval(untiled, tiled)
+
+            XCTAssertEqual(tiled.shape, videoGolden.shape, "spatial-tiled shape mismatch")
+            let vsGolden = maxAbsDiff(tiled, videoGolden)
+            let vsUntiled = maxAbsDiff(tiled, untiled)
+            print("[vae22 spatial-tile] tiles=2 vs golden: max-abs=\(vsGolden) · vs untiled: max-abs=\(vsUntiled) shape=\(tiled.shape)")
+            XCTAssertEqual(vsUntiled, 0.0, "spatial tiling must be result-invariant (crop, not blend): max-abs \(vsUntiled)")
+            XCTAssertLessThan(vsGolden, 1e-4, "spatial-tiled decode vs golden max-abs \(vsGolden)")
+        }
+    }
+
     /// Stage bisector (diagnostic): replicate the oracle's staged decode and print
     /// the per-stage max/mean vs `st_*.npy`. Stages are ≤6e-5 until the first
     /// big-spatial conv; useful for localizing any future regression.
