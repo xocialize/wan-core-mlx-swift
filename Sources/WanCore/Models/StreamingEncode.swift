@@ -43,6 +43,11 @@ public func encodeStreaming(vae: WanVAE, _ x: MLXArray) -> MLXArray {
             print("[WanVAE encode] chunk \(i + 1)/\(numChunks) (frames \(chunk.dim(2))): "
                 + "active=\(gb(s.activeMemory)) cache=\(gb(s.cacheMemory)) peak=\(gb(s.peakMemory)) GB")
         }
+        // Cooperative cancellation (CAN gate): bail per encoded chunk. The API is
+        // non-throwing, so this returns a truncated latent; the consumer wrapper's
+        // post-encode `try Task.checkCancellation()` discards it and rethrows.
+        // Placed AFTER the first append so `outs` is never empty at the concat.
+        if Task.isCancelled { break }
     }
 
     let out = concatenated(outs, axis: 2)

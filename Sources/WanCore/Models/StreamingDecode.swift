@@ -189,6 +189,11 @@ public func decodeStreaming(
         }
         outs.append(oc)
         start += chunkLat
+        // Cooperative cancellation (CAN gate): bail per decoded chunk. The API is
+        // non-throwing, so this returns a truncated video; the consumer wrapper's
+        // post-decode `try Task.checkCancellation()` discards it and rethrows.
+        // Placed AFTER the first append so `outs` is never empty at the concat.
+        if Task.isCancelled { break }
     }
     return clip(concatenated(outs, axis: 2), min: -1, max: 1)
 }
