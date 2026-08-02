@@ -136,6 +136,14 @@ open class WanModel: Module, @unchecked Sendable {
     public var freqs: MLXArray { buffers.freqs }
     public var invFreq: MLXArray { buffers.invFreq }
 
+    /// HV2 weight streaming (opt-in per config; NEUROSTREAM-ACTIONS HV2). When a
+    /// `BlockStreamer` is attached (via `BlockStreamer.bind`), `runBlocks` and
+    /// `prepareCrossKV` route through the streamed group loop — block parameters
+    /// are slot-backed and refilled from granule files between group boundaries.
+    /// Nil (the default) leaves every existing path byte-for-byte untouched.
+    /// Set to nil by the streamer itself on fully-resident fallback.
+    public internal(set) var blockStreamer: BlockStreamer?
+
     public init(_ config: WanConfig) {
         self.config = config
         self.dim = config.dim
@@ -243,8 +251,30 @@ open class WanModel: Module, @unchecked Sendable {
     }
 
     /// Pre-compute cross-attention K/V for all blocks (one (k, v) per block).
+    /// With a `BlockStreamer` attached this sweeps the blocks group-by-group as
+    /// their granules arrive — the FIRST refill sweep, which doubles as the
+    /// streamer's S (refill bandwidth) calibration, off the denoise critical path.
     public func prepareCrossKV(_ context: MLXArray) -> [(MLXArray, MLXArray)] {
-        blocks.map { $0.crossAttn.prepareKV(context) }
+        guard let streamer = blockStreamer else {
+            return blocks.map { $0.crossAttn.prepareKV(context) }
+        }
+        streamer.ensureActive(for: self)
+        var out: [(MLXArray, MLXArray)] = []
+        for g in 0..<streamer.numGroups {
+            streamer.acquireGroup()
+            var groupArrays: [MLXArray] = []
+            for i in streamer.blockRange(g) {
+                let (k, v) = blocks[i].crossAttn.prepareKV(context)
+                out.append((k, v))
+                groupArrays.append(k)
+                groupArrays.append(v)
+            }
+            // Group-boundary eval BEFORE releasing the slot: the K/V must be
+            // materialized while this group's weights are still resident.
+            eval(groupArrays)
+            streamer.releaseGroup()
+        }
+        return out
     }
 
     /// Pre-compute RoPE cos/sin for constant grid sizes.
@@ -403,6 +433,12 @@ open class WanModel: Module, @unchecked Sendable {
         ropeCosSin: (MLXArray, MLXArray)? = nil,
         blockResiduals: [Int: MLXArray]? = nil
     ) {
+        if let streamer = blockStreamer {
+            runBlocksStreamed(
+                &s, streamer: streamer, crossKVCaches: crossKVCaches,
+                ropeCosSin: ropeCosSin, blockResiduals: blockResiduals)
+            return
+        }
         // At large sequence length (multi-frame video on the GPU), bf16 attention on Metal is
         // numerically unstable — see `wanLargeSeq`: `eval` after each block BOUNDs the lazy graph
         // (mlx-lm-idiomatic graph-size control), resetting MLX's Metal buffer-reuse and suppressing
@@ -449,5 +485,44 @@ open class WanModel: Module, @unchecked Sendable {
     public func finish(_ s: ForwardState) -> [MLXArray] {
         let x = head(s.x, s.e)
         return unpatchify(x, gridSizes: s.gridSizes).map { $0.asType(.float32) }
+    }
+
+    /// The streamed block loop (HV2): STEP-MAJOR over granule groups — wait for
+    /// the group's slot, run its blocks, `eval` at the group boundary, hand the
+    /// slot back to the refill thread. The group-boundary eval is the handoff
+    /// that makes refills invisible to the lazy graph; it subsumes the
+    /// `wanLargeSeq` per-block eval for the last block of each group (per-block
+    /// evals stay ON within groups at large seqLen — same numerics discipline
+    /// as the resident path). The first streamed forward also feeds the runtime
+    /// gate: `endForward` evaluates N ≥ B·F/(2·S) from in-regime measurements
+    /// and may fall back to fully-resident (detaching the streamer) before the
+    /// next forward. (The deep per-block profiler path is intentionally not
+    /// composed here — its barrier would distort the slot handoff timing.)
+    func runBlocksStreamed(
+        _ s: inout ForwardState,
+        streamer: BlockStreamer,
+        crossKVCaches: [(MLXArray, MLXArray)]? = nil,
+        ropeCosSin: (MLXArray, MLXArray)? = nil,
+        blockResiduals: [Int: MLXArray]? = nil
+    ) {
+        let evalEachBlock = s.x.dim(1) >= wanLargeSeq
+        streamer.ensureActive(for: self)
+        streamer.beginForward(tokens: s.x.dim(0) * s.x.dim(1))
+        for g in 0..<streamer.numGroups {
+            let range = streamer.blockRange(g)
+            streamer.acquireGroup()
+            for i in range {
+                let kv = crossKVCaches?[i]
+                s.x = blocks[i](
+                    s.x, e: s.e0, seqLens: s.seqLensList, gridSizes: s.gridSizes,
+                    freqs: freqs, context: s.contextBatch, contextLens: nil,
+                    crossKVCache: kv, ropeCosSin: ropeCosSin, attnMask: s.attnMask)
+                if let r = blockResiduals?[i] { s.x = s.x + r }
+                if evalEachBlock, i != range.upperBound - 1 { eval(s.x) }
+            }
+            eval(s.x)  // group boundary — slot handoff; MUST precede releaseGroup
+            streamer.releaseGroup()
+        }
+        streamer.endForward()
     }
 }

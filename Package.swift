@@ -13,6 +13,10 @@ let package = Package(
     ],
     products: [
         .library(name: "WanCore", targets: ["WanCore"]),
+        // HV2 weight streaming (NEUROSTREAM-ACTIONS): granule layout tool +
+        // the streaming receipts gate (parity / runtime gate / 16 GB emulation).
+        .executable(name: "wan-granule-layout", targets: ["GranuleLayoutCLI"]),
+        .executable(name: "RunWanStream", targets: ["RunWanStream"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
@@ -28,6 +32,21 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Sources/WanCore"
+        ),
+        .executableTarget(
+            name: "GranuleLayoutCLI",
+            dependencies: ["WanCore"],
+            path: "Sources/GranuleLayoutCLI"
+        ),
+        .executableTarget(
+            name: "RunWanStream",
+            dependencies: [
+                "WanCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "Sources/RunWanStream"
         ),
         .testTarget(
             name: "WanCoreTests",
