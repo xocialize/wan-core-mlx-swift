@@ -38,7 +38,7 @@ let blockPrefix = argValue("--block-prefix") ?? "blocks."
 print("layout: \(source.path)")
 print("   out: \(outDir.path)")
 do {
-    let result = try GranuleLayout.write(
+    let result = try WanGranuleLayout.write(
         safetensors: source, outputDir: outDir, blockPrefix: blockPrefix
     ) { done, total in
         if done % 8 == 0 || done == total {

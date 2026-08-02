@@ -73,7 +73,7 @@ final class BlockStreamerTests: XCTestCase {
         try MLX.save(arrays: flat, url: ckpt)
 
         let granules = dir.appendingPathComponent("granules")
-        let result = try GranuleLayout.write(safetensors: ckpt, outputDir: granules)
+        let result = try WanGranuleLayout.write(safetensors: ckpt, outputDir: granules)
         XCTAssertEqual(result.manifest.blockCount, tinyConfig.numLayers)
         return (reference, ckpt, granules)
     }

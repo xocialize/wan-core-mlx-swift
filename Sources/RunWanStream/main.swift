@@ -179,7 +179,7 @@ func ensureLayout(variant: String) throws {
             continue
         }
         log("L · \(variant)/\(expert): laying out \(file) → \(out.path)")
-        let result = try GranuleLayout.write(safetensors: source, outputDir: out)
+        let result = try WanGranuleLayout.write(safetensors: source, outputDir: out)
         log(String(
             format: "L · %@/%@: %d blocks · %d tensors/block · %.2f GiB streamed · %.1fs (%.2f GiB/s write)",
             variant, expert, result.manifest.blockCount,

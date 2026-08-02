@@ -20,6 +20,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
+        // HV2 weight streaming substrate (BlockStreamKit v0.2.0) — the model-agnostic
+        // core extracted from this package's in-tree implementation (b45b879) and
+        // ltx-2-mlx-swift's; sibling path dep until the kit repo goes public+tagged.
+        .package(path: "../mlx-block-stream-swift"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
     ],
     targets: [
@@ -30,6 +34,7 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "BlockStreamKit", package: "mlx-block-stream-swift"),
             ],
             path: "Sources/WanCore"
         ),
