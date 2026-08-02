@@ -240,6 +240,33 @@ public final class BlockStreamer: @unchecked Sendable {
         eval(expert.parameters())  // globals only touch resident arrays; slots hold zeros
     }
 
+    /// Manifest-v2 variant: load the globals from the granule tree's own
+    /// sidecar — no source checkpoint needed (hosted trees; integrity via
+    /// `core.verifyIntegrity()` post-download). Same missing-keys contract as
+    /// the checkpoint variant; sidecar extras the model never loads (the int4
+    /// checkpoints' serialized `freqs`) are tolerated and skipped.
+    public func loadStreamingGlobals(expert: WanModel) throws {
+        guard let index = expertIndex[ObjectIdentifier(expert)] else {
+            throw BlockStreamerError.state("expert not bound")
+        }
+        let blockPrefix = core.manifests[index].blockPrefix
+        let wanted = Set(
+            expert.parameters().flattened().map(\.0).filter { !$0.hasPrefix(blockPrefix) })
+        let raw = try core.loadGlobalTensors(set: index)
+        let available = Set(raw.map(\.key))
+        let missing = wanted.subtracting(available)
+        guard missing.isEmpty else {
+            throw BlockStreamerError.contract(
+                "globals missing from sidecar: \(missing.sorted().prefix(5))")
+        }
+        let picked = raw.filter { wanted.contains($0.key) }
+        WeightLoader.materialize(Dictionary(uniqueKeysWithValues: picked))
+        try expert.update(
+            parameters: ModuleParameters.unflattened(picked),
+            verify: [.noUnusedKeys])
+        eval(expert.parameters())
+    }
+
     /// Make `model`'s granule set the streamed one, (re)starting the prefetch
     /// thread at group 0. Called automatically by the streamed forward/KV
     /// paths; switching experts (the A14B t=875 boundary) is just a different
