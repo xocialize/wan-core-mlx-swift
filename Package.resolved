@@ -1,5 +1,5 @@
 {
-  "originHash" : "1e6e9990599413012d5b7f26413ed1359a39363928a0133888e2738031cfbe66",
+  "originHash" : "29ed18510a839a5eb60a5310783a31d49823100e7793657af92846f4ba47ac81",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -8,6 +8,15 @@
       "state" : {
         "revision" : "a3a85a85214caf642abaa96ae664e4c772a59f6e",
         "version" : "1.4.1"
+      }
+    },
+    {
+      "identity" : "mlx-block-stream-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/xocialize/mlx-block-stream-swift",
+      "state" : {
+        "revision" : "5df6d7337135394ea27e9b3f7879bfc06d4c3700",
+        "version" : "0.5.0"
       }
     },
     {

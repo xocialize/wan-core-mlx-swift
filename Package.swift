@@ -20,10 +20,11 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
-        // HV2 weight streaming substrate (BlockStreamKit v0.2.0) — the model-agnostic
-        // core extracted from this package's in-tree implementation (b45b879) and
-        // ltx-2-mlx-swift's; sibling path dep until the kit repo goes public+tagged.
-        .package(path: "../mlx-block-stream-swift"),
+        // HV2 weight streaming substrate (BlockStreamKit) — the model-agnostic core
+        // extracted from this package's in-tree implementation (b45b879) and
+        // ltx-2-mlx-swift's. Versioned dep since 2026-08-14: the kit repo went public +
+        // tagged v0.5.0, the condition the sibling path dep was waiting on.
+        .package(url: "https://github.com/xocialize/mlx-block-stream-swift", from: "0.5.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
     ],
     targets: [
