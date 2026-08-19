@@ -250,6 +250,16 @@ open class WanModel: Module, @unchecked Sendable {
         return embedded.asType(modelDtype)
     }
 
+    /// Embed one raw context WITHOUT the classic-Wan zero-pad to `textLen`.
+    /// Bernini-v2's planner-conditioned path (varlen cross-attention upstream)
+    /// feeds exact-length T5+planner concat contexts — the classic pad would add
+    /// embedded-zero keys and shift the cross-attention output.
+    public func embedTextUnpadded(_ context: MLXArray) -> MLXArray {
+        let modelDtype = linearDtype(patchEmbeddingProj)
+        let batch = context.ndim == 2 ? context[.newAxis] : context
+        return textEmbedding1(geluApproximate(textEmbedding0(batch))).asType(modelDtype)
+    }
+
     /// Pre-compute cross-attention K/V for all blocks (one (k, v) per block).
     /// With a `BlockStreamer` attached this sweeps the blocks group-by-group as
     /// their granules arrive — the FIRST refill sweep, which doubles as the
