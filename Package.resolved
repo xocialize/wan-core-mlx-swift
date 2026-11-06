@@ -1,5 +1,5 @@
 {
-  "originHash" : "29ed18510a839a5eb60a5310783a31d49823100e7793657af92846f4ba47ac81",
+  "originHash" : "319459ae808eec0370520964245e06d9a6f199bd6091a4a976224cdc552fb7ec",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/xocialize/mlx-block-stream-swift",
       "state" : {
-        "revision" : "5df6d7337135394ea27e9b3f7879bfc06d4c3700",
-        "version" : "0.5.0"
+        "revision" : "6439cc090ebf94692a2b1cb0175699015780edd0",
+        "version" : "0.5.1"
       }
     },
     {
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/ml-explore/mlx-swift.git",
       "state" : {
-        "revision" : "dc43e62d7055353c7f99fa071a4e71d29dfddc44",
-        "version" : "0.31.4"
+        "revision" : "19601207e9a0de51e03ee6ec0c3c5f3784275075",
+        "version" : "0.32.3"
       }
     },
     {

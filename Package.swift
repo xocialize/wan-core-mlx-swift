@@ -19,7 +19,9 @@ let package = Package(
         .executable(name: "RunWanStream", targets: ["RunWanStream"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
+        // Floor 0.32.3: <= 0.31.6 JIT-miscompiles the NAX split-K bf16 GEMM (mlx#3797/#3810), which
+        // breaks TI2V-5B ffn.fc2 at B·L 1366–4778 (AB-R-0778). Ceiling matches mlx-block-stream-swift.
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", "0.32.3"..<"0.33.0"),
         // HV2 weight streaming substrate (BlockStreamKit) — the model-agnostic core
         // extracted from this package's in-tree implementation (b45b879) and
         // ltx-2-mlx-swift's. Versioned dep since 2026-08-14: the kit repo went public +

@@ -21,12 +21,10 @@
 //     weight streaming attacks (umT5 is paged+evicted per §2.4 and the VAE has
 //     its own streaming levers). Stated again in the receipt header.
 //
-// NAX split-K note (checked for this receipt): A14B ffn.fc2 is K=13824 ≥ 10240,
-// inside the NAX bf16 GEMM JIT window once M·N = (B·L)·5120 ≥ 2048² i.e.
-// B·L ≥ 819 tokens. The small-N parity config is pinned BELOW that (B·L = 768)
-// so parity bytes are window-clean; larger-N arms compare streamed-vs-resident
-// through IDENTICAL kernels, so those comparisons hold regardless, and the
-// production numerics path (fp32 SDPA ≥ wanLargeSeq) is wan-core's default.
+// NAX split-K note (corrected 2026-11-06, AB-R-0778): the mlx-swift ≤0.31.6 window also
+// requires K ≥ 3·max(M,N), so A14B ffn.fc2 (K=13824 < 3·5120) NEVER entered it; only
+// TI2V-5B fc2 (K=14336, N=3072) did, at B·L ∈ [1366, 4778]. wan-core now floors
+// mlx-swift at 0.32.3, which carries the fix (mlx#3810); NaxSplitKGuardTests guards it.
 
 import Foundation
 import MLX
