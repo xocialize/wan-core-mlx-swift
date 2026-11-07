@@ -44,7 +44,7 @@ private func spatialUpsample(_ rs: Resample, _ x: MLXArray) -> MLXArray {
     var xf = x.transposed(0, 2, 3, 4, 1).reshaped(b * t, h, w, c)  // [BT,H,W,C]
     xf = repeated(xf, count: 2, axis: 1)
     xf = repeated(xf, count: 2, axis: 2)
-    xf = rs.resample[1]!(xf)  // Conv2d -> [BT,2H,2W,C//2]
+    xf = rs.upsampleConv(xf)  // Conv2d -> [BT,2H,2W,C//2] (exact-routed on GPU)
     let co = xf.dim(3)
     return xf.reshaped(b, t, h * 2, w * 2, co).transposed(0, 4, 1, 2, 3)
 }

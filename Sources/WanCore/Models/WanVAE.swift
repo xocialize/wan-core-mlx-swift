@@ -34,6 +34,7 @@
 
 import Foundation
 import MLX
+import MLXExactConv
 import MLXFast
 import MLXNN
 
@@ -123,6 +124,25 @@ public final class FeatIdx: @unchecked Sendable {
     public init() {}
 }
 
+// MARK: - GPU conv routing (AB-A-0113)
+
+/// Route for the 16-ch VAE's convs on the GPU. mlx's Winograd conv2d (3×3, stride 1, C/O % 32,
+/// C+O ≥ 256, N·H·W ≥ 4096) is lossy on M5/NAX GPUs (TF32 batched GEMM, ~6.4e-3 relL2 per conv in
+/// fp32), and mlx-swift 0.32.x also splits small-depth conv3d into per-frame Winograd conv2d
+/// (mlx#3785). On the GPU, `CausalConv3d` goes through `ExactConv.conv3d` (changes only shapes 0.32
+/// would split into Winograd) and the Resample upsample conv through `ExactConv.conv2d`; both also
+/// stay off mlx 0.32's channel-pad helpers (AB-T-0214). Env `WAN_VAE_CONV_ROUTE` = exact (default)
+/// | winograd | fp32Winograd | raw (= the pre-0.6.0 behavior, for A/B). The CPU stream always
+/// runs the original convs, unchanged, so the CPU parity gates stay bit-exact. (vae22 has its own
+/// `WAN_VAE22_CONV_ROUTE`.)
+let wanVAEConvRouteEnv = ProcessInfo.processInfo.environment["WAN_VAE_CONV_ROUTE"]
+let wanVAEConvRoute: ExactConvRoute = ExactConvRoute.environment("WAN_VAE_CONV_ROUTE") ?? .exact
+
+/// True when the current default device is the GPU and the exact route is not disabled.
+func wanVAEExactOnGPU() -> Bool {
+    Device.defaultDevice().deviceType == .gpu && wanVAEConvRouteEnv != "raw"
+}
+
 // MARK: - CausalConv3d
 
 /// 3D convolution with causal temporal padding.
@@ -206,7 +226,11 @@ public final class CausalConv3d: Module, @unchecked Sendable {
     /// identical `[O, D, H, W, I]` weight layout, so we call it directly.
     /// x: [B, T, H, W, C_in] -> [B, T_out, H_out, W_out, C_out]
     private func _conv3d(_ x: MLXArray) -> MLXArray {
-        conv3d(x, weight, stride: .init((stride.0, stride.1, stride.2)), padding: 0) + bias
+        if wanVAEExactOnGPU() {
+            return ExactConv.conv3d(
+                x, weight: weight, bias: bias, stride: stride, exact: wanVAEConvRoute != .winograd)
+        }
+        return conv3d(x, weight, stride: .init((stride.0, stride.1, stride.2)), padding: 0) + bias
     }
 }
 
@@ -380,6 +404,14 @@ public final class Resample: Module, @unchecked Sendable {
 
     private var resample1: Conv2d { resample[1]! }
 
+    /// The upsample modes' 3×3 Conv2d (padding 1), exact-routed on the GPU (see `wanVAEConvRoute`).
+    /// Shared with the streaming decode. x: [N, H, W, C].
+    func upsampleConv(_ x: MLXArray) -> MLXArray {
+        guard wanVAEExactOnGPU() else { return resample1(x) }
+        return ExactConv.conv2d(
+            x, weight: resample1.weight, bias: resample1.bias, padding: (1, 1), route: wanVAEConvRoute)
+    }
+
     public init(_ dim: Int, mode: String) {
         precondition(
             ["upsample2d", "upsample3d", "downsample2d", "downsample3d"].contains(mode)
@@ -443,7 +475,7 @@ public final class Resample: Module, @unchecked Sendable {
             x = x.transposed(0, 2, 3, 4, 1).reshaped(b * t, h, w, c)  // [BT, H, W, C]
             x = repeated(x, count: 2, axis: 1)
             x = repeated(x, count: 2, axis: 2)
-            x = resample1(x)  // Conv2d [BT, 2H, 2W, C//2]
+            x = upsampleConv(x)  // Conv2d [BT, 2H, 2W, C//2]
             let cOut = x.dim(-1)
             return x.reshaped(b, t, h * 2, w * 2, cOut).transposed(0, 4, 1, 2, 3)
         } else {
