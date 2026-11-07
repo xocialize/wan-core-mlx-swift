@@ -10,27 +10,21 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Sequence-length threshold above which the Metal bf16 attention path is unstable
-/// (nondeterministic NaNs / wrong values in the long-seq fused kernel + lazy-graph
-/// buffer reuse — mlx-swift 0.31.4, Apple Silicon). Above it we switch on two
-/// idiomatic mitigations: fp32 SDPA (in the attention modules) + per-block `eval`
-/// (in `WanModel`). Below it (t2i, low-res, the A14B-validated paths) nothing
-/// changes — the bf16 graph stays bit-identical. ~256² single-frame = seqLen 256
-/// (safe); 512²×17f = 1280 (the first observed failure), so the gate sits between.
+/// Sequence-length threshold for per-block `eval` in `WanModel` (bounds the lazy graph at video
+/// scale). History: introduced in June 2026 with an fp32 SDPA upcast as mitigations for "Metal bf16
+/// is unstable at large seqLen" (mlx-swift 0.31.4). That instability was the NAX split-K bf16 GEMM
+/// miscompile in TI2V-5B's ffn.fc2 (ml-explore/mlx#3797, fixed in mlx-swift 0.32.3 — AB-R-0778),
+/// not attention. Per-block eval stays (graph/memory bound, harmless); the upcast is retired below.
 public let wanLargeSeq = 1024
 
-/// EXPERIMENT KNOB (E15 / mlx-video diff): `wanLargeSeq` gates TWO mitigations — the fp32 SDPA
-/// upcast (in the attention modules) AND the per-block `eval` (in `WanModel`/branches). The NaN
-/// they mitigate was traced to the long-seq **fused-kernel dispatch race + lazy-graph buffer
-/// reuse**, for which the per-block `eval` (graph chaining) is the actual fix — so the fp32
-/// upcast may be REDUNDANT for correctness yet the memory/speed driver at large seqLen (fp32
-/// drops out of the fused flash kernel that mlx-video rides in bf16). This flag disables ONLY the
-/// upcast (per-block eval stays gated on `wanLargeSeq`), to run the bf16-fused path and discriminate
-/// whether fp32 is load-bearing. `WAN_FP32_SDPA=0` → bf16 SDPA at all seqLens (mlx-video's behavior);
-/// default (unset / non-"0") preserves the current fp32-upcast behavior. Decoupling matters: raising
-/// `wanLargeSeq` alone would ALSO turn off per-block eval and un-bound the graph.
+/// Opt-in fp32 SDPA upcast at seqLen ≥ `wanLargeSeq` (`WAN_FP32_SDPA=1`). **Default OFF since
+/// wan-core 0.4.0** (2026-11-06): MLX's fused bf16 SDPA accumulates in fp32 and is BIT-IDENTICAL to
+/// upcast-then-cast (op level L=1024–8192; wan-core block 0 at production Q for TI2V-5B, Wan 1.3B
+/// and Wan 14B — Δ = 0), while the upcast drops out of the fused kernel and costs 1.7–2.1× per
+/// block (AB-R-0787 follow-up, mlxengine-todo/probes/bf16-block-bisect FamilyCheck). Kept only as
+/// a diagnostic switch. fp32 DiTs are unaffected either way.
 public let wanForceFp32SdpaLargeSeq =
-    ProcessInfo.processInfo.environment["WAN_FP32_SDPA"].map { $0 != "0" } ?? true
+    ProcessInfo.processInfo.environment["WAN_FP32_SDPA"].map { $0 != "0" } ?? false
 
 /// Compute sinusoidal positional embeddings.
 /// position: 1D [L] or 2D [B, L] -> [L, dim] or [B, L, dim].
@@ -449,11 +443,11 @@ open class WanModel: Module, @unchecked Sendable {
                 ropeCosSin: ropeCosSin, blockResiduals: blockResiduals)
             return
         }
-        // At large sequence length (multi-frame video on the GPU), bf16 attention on Metal is
-        // numerically unstable — see `wanLargeSeq`: `eval` after each block BOUNDs the lazy graph
-        // (mlx-lm-idiomatic graph-size control), resetting MLX's Metal buffer-reuse and suppressing
-        // the nondeterministic long-seq NaN (paired with fp32 SDPA). Small-seq paths keep the
-        // unbounded bf16 graph, so they stay bit-identical. (`WANCORE_DEBUG_NAN` adds a probe.)
+        // At large sequence length (multi-frame video), `eval` after each block BOUNDs the lazy graph
+        // (mlx-lm-idiomatic graph-size control) — see `wanLargeSeq`. It was introduced against a
+        // "long-seq bf16 NaN" that turned out to be the NAX split-K GEMM miscompile (AB-R-0778); it
+        // stays for graph/memory bounding. Small-seq paths keep the unbounded graph.
+        // (`WANCORE_DEBUG_NAN` adds a probe.)
         let evalEachBlock = s.x.dim(1) >= wanLargeSeq
         let debugNaN = ProcessInfo.processInfo.environment["WANCORE_DEBUG_NAN"] != nil
         // Opt-in fine per-block attribution (`WAN_PROFILE_DEEP=blocks`). Forces a per-block eval

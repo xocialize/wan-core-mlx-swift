@@ -136,12 +136,8 @@ class WanSelfAttention: Module {
             mask = paddingMask(seqLens: seqLens, total: s, dtype: qT.dtype)
         }
 
-        // Metal bf16 self-attention is unstable at large seqLen → fp32 SDPA there (the
-        // QK^T/softmax-V chain; same house-style remedy WanVAE uses on the .cpu stream).
-        // Small seqLen stays bf16, bit-identical. Paired with per-block eval in WanModel.
-        // `WAN_FP32_SDPA=0` disables ONLY this upcast (per-block eval stays) — the E15
-        // experiment to run the bf16-fused path (mlx-video's behavior) and test whether the
-        // fp32 upcast is load-bearing or just the memory/speed driver. See `wanForceFp32SdpaLargeSeq`.
+        // Optional fp32 SDPA at large seqLen (`WAN_FP32_SDPA=1`; default off since 0.4.0 — the fused
+        // bf16 kernel is bit-identical and ~2× faster, see `wanForceFp32SdpaLargeSeq`).
         let largeSeq = (s >= wanLargeSeq) && wanForceFp32SdpaLargeSeq
         let (qS, kS, vS) = largeSeq
             ? (qT.asType(.float32), kT.asType(.float32), vT.asType(.float32)) : (qT, kT, vT)
