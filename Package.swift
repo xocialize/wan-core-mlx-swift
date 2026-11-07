@@ -28,6 +28,8 @@ let package = Package(
         // tagged v0.5.0, the condition the sibling path dep was waiting on.
         .package(url: "https://github.com/xocialize/mlx-block-stream-swift", from: "0.5.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
+        // Exact-class GPU convs for vae22's decoder (AB-A-0113): mlx's Winograd conv2d is lossy on NAX.
+        .package(url: "https://github.com/xocialize/mlx-exact-conv-swift", from: "0.1.1"),
     ],
     targets: [
         .target(
@@ -38,6 +40,7 @@ let package = Package(
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "BlockStreamKit", package: "mlx-block-stream-swift"),
+                .product(name: "MLXExactConv", package: "mlx-exact-conv-swift"),
             ],
             path: "Sources/WanCore"
         ),

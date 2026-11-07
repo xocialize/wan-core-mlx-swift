@@ -12,8 +12,31 @@
 
 import Foundation
 import MLX
+import MLXExactConv
 import MLXFast
 import MLXNN
+
+// MARK: - GPU conv routing (AB-A-0113)
+
+/// Route for vae22's 3×3 conv2d on the GPU. mlx's Winograd conv2d (3×3, stride 1, C/O % 32,
+/// C+O ≥ 256, N·H·W ≥ 4096) is lossy on M5/NAX GPUs — its batched GEMM runs TF32, ~6.4e-3 relL2
+/// per conv in fp32 — and most of the 720p decoder sits in that window. On the GPU the in-window
+/// convs take `ExactConv`'s implicit-GEMM path (mlx-exact-conv-swift), which also keeps every conv
+/// off mlx 0.32's channel-pad helpers (the cache-limit GPU fault, AB-T-0214). Env
+/// `WAN_VAE22_CONV_ROUTE` = exact (default) | winograd | fp32Winograd | raw (= plain conv2d, the
+/// pre-0.5.0 behavior, for A/B). The CPU stream always runs plain conv2d, unchanged, so the
+/// CPU parity gates stay bit-exact.
+let wanVAE22ConvRouteEnv = ProcessInfo.processInfo.environment["WAN_VAE22_CONV_ROUTE"]
+let wanVAE22ConvRoute: ExactConvRoute =
+    ExactConvRoute.environment("WAN_VAE22_CONV_ROUTE") ?? .exact
+
+/// vae22's conv2d (NHWC input, OHWC weight): plain on the CPU, exact-routed on the GPU.
+func vae22Conv2d(_ x: MLXArray, _ w: MLXArray, stride: (Int, Int) = (1, 1)) -> MLXArray {
+    if Device.defaultDevice().deviceType != .gpu || wanVAE22ConvRouteEnv == "raw" {
+        return conv2d(x, w, stride: .init(stride))
+    }
+    return ExactConv.conv2d(x, weight: w, stride: stride, route: wanVAE22ConvRoute)
+}
 
 // MARK: - Per-channel latent normalization (z_dim=48)
 
@@ -219,7 +242,7 @@ public final class V22CausalConv3d: Module, @unchecked Sendable {
             for d in 0..<kd {
                 let frame = x[0..., tStart + d]        // [B, Hp, Wp, C]
                 let w2d = weight[0..., d, 0..., 0..., 0...]  // [O, kh, kw, I]
-                let convOut = conv2d(frame, w2d, stride: .init((stride.1, stride.2)))
+                let convOut = vae22Conv2d(frame, w2d, stride: (stride.1, stride.2))
                 accum = accum == nil ? convOut : accum! + convOut
             }
             outputs.append(accum! + bias)
@@ -401,12 +424,12 @@ public final class V22Resample: Module, @unchecked Sendable {
     /// 3×3 Conv2d with symmetric padding=1. x: [N, H, W, C].
     private func conv2dPad1(_ x: MLXArray) -> MLXArray {
         let xp = padded(x, widths: [.init((0, 0)), .init((1, 1)), .init((1, 1)), .init((0, 0))])
-        return conv2d(xp, resampleWeight) + resampleBias
+        return vae22Conv2d(xp, resampleWeight) + resampleBias
     }
     /// Strided 3×3 Conv2d for downsampling — ZeroPad2d((0,1,0,1)) then stride 2.
     private func downsampleConv2d(_ x: MLXArray) -> MLXArray {
         let xp = padded(x, widths: [.init((0, 0)), .init((0, 1)), .init((0, 1)), .init((0, 0))])
-        return conv2d(xp, resampleWeight, stride: .init((2, 2))) + resampleBias
+        return vae22Conv2d(xp, resampleWeight, stride: (2, 2)) + resampleBias
     }
 
     /// x: [B, T, H, W, C].

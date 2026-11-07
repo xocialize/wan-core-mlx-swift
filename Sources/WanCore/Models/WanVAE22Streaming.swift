@@ -49,7 +49,7 @@ private func spatialUpsample22(_ rs: V22Resample, _ x: MLXArray) -> MLXArray {
     var xf = x.reshaped(b * t, h, w, c)
     xf = repeated(repeated(xf, count: 2, axis: 1), count: 2, axis: 2)
     xf = padded(xf, widths: [.init((0, 0)), .init((1, 1)), .init((1, 1)), .init((0, 0))])
-    xf = conv2d(xf, rs.resampleWeight) + rs.resampleBias
+    xf = vae22Conv2d(xf, rs.resampleWeight) + rs.resampleBias
     return xf.reshaped(b, t, xf.dim(1), xf.dim(2), c)
 }
 
